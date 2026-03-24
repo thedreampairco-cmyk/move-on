@@ -1,18 +1,22 @@
+// server.js
 const express = require('express');
 const mongoose = require('mongoose');
-const env = require('./config/env'); 
+const env = require('./config/env');
 const webhookRoutes = require('./routes/webhook');
-// require('./cronJobs'); // Comment this out temporarily if it's crashing
 
 const app = express();
 app.use(express.json());
 
-// 🔴 THE DIAGNOSTIC LOG: This will print your URI to the terminal.
-// If it prints "undefined", your .env file is empty or named wrong.
-console.log("🚨 DEBUG - MONGO_URI IS:", env.MONGO_URI);
+// 🕵️ THE RENDER CONFESSION LOG: 
+// This will print out the NAMES of the variables Render is actually providing.
+const safeKeys = Object.keys(process.env).filter(k => 
+    k.includes('MONGO') || k.includes('GROQ') || k.includes('GREEN')
+);
+console.log("🚨 DETECTED CLOUD KEYS:", safeKeys);
+console.log("🚨 env.js MONGO_URI IS:", env.MONGO_URI ? "HIDDEN_BUT_EXISTS" : "undefined");
 
 if (!env.MONGO_URI) {
-    console.error("❌ FATAL: MONGO_URI is completely missing from your .env file!");
+    console.error("❌ FATAL: The code still cannot see the MONGO_URI!");
     process.exit(1);
 }
 
@@ -26,4 +30,3 @@ app.use('/webhook', webhookRoutes);
 app.listen(env.PORT, () => {
     console.log(`[Server] Move On Bot is alive on port ${env.PORT}`);
 });
-
