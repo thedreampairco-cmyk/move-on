@@ -25,6 +25,11 @@ mongoose.connect(env.MONGO_URI)
     .then(() => console.log('[Database] MongoDB Memory Vault Connected Successfully'))
     .catch(err => console.error('[Database] MongoDB Connection Error:', err.message));
 
+// Health Check Route (Click this in your browser)
+app.get('/', (req, res) => {
+    res.status(200).send("✅ Move-On Bot is Live and Reachable on the internet!");
+});
+
 app.use('/webhook', webhookRoutes);
 
 app.listen(env.PORT, () => {
