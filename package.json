@@ -1,0 +1,31 @@
+{
+  "name": "move-on",
+  "version": "1.0.0",
+  "description": "",
+  "main": "cronJobs.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thedreampairco-cmyk/move-on.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/thedreampairco-cmyk/move-on/issues"
+  },
+  "homepage": "https://github.com/thedreampairco-cmyk/move-on#readme",
+  "dependencies": {
+    "axios": "^1.13.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "groq": "^5.17.1",
+    "groq-sdk": "^1.1.1",
+    "mongoose": "^9.3.2",
+    "node-cron": "^4.2.1"
+  }
+}
