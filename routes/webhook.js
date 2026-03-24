@@ -12,19 +12,17 @@ router.post('/', async (req, res) => {
 
         console.log("🚨 RAW WEBHOOK HIT:\n", JSON.stringify(body, null, 2));
 
-        // 1. Filter: Process ONLY incoming text or extended text messages
+        // 1. Filter
         const validTypes = ['textMessage', 'extendedTextMessage'];
-        
         if (body.typeWebhook !== 'incomingMessageReceived' || 
             !body.messageData || 
             !validTypes.includes(body.messageData.typeMessage)) {
-            console.log("⚠️ Ignored: Event is not an incoming text message.");
-            return res.status(200).send('Ignored: Not a text message');
+            return res.status(200).send('Ignored');
         }
 
         const chatId = body.senderData.chatId;
         
-        // 🚨 FIX: Extract text dynamically based on the exact message type
+        // Extract text
         let userText = "";
         if (body.messageData.typeMessage === 'textMessage') {
             userText = body.messageData.textMessageData.textMessage;
@@ -34,12 +32,14 @@ router.post('/', async (req, res) => {
 
         console.log(`[Move-On Bot] Processing message from ${chatId}: "${userText}"`);
 
-        // 2. Fetch User & Memory Vault
-        let userProfile = await User.findOne({ phone: chatId });
+        // 2. Fetch User & Memory Vault 
+        // 🔥 FIX: Querying by chatId instead of phone
+        let userProfile = await User.findOne({ chatId: chatId });
         
         if (!userProfile) {
+            // 🔥 FIX: Saving as chatId instead of phone
             userProfile = await User.create({
-                phone: chatId,
+                chatId: chatId,
                 name: body.senderData.senderName || 'there',
                 gender: 'unknown',
                 memoryTags: {}
@@ -84,8 +84,9 @@ router.post('/', async (req, res) => {
             .then(async (newTags) => {
                 if (newTags && Object.keys(newTags).length > 0) {
                     const updatedTags = { ...userProfile.memoryTags, ...newTags };
+                    // 🔥 FIX: Updating by chatId instead of phone
                     await User.updateOne(
-                        { phone: chatId }, 
+                        { chatId: chatId }, 
                         { $set: { memoryTags: updatedTags } }
                     );
                     console.log(`[Memory Vault Updated] for ${chatId}:`, newTags);
@@ -93,7 +94,6 @@ router.post('/', async (req, res) => {
             })
             .catch(err => console.error('[Shadow Extraction Promise Error]:', err.message));
 
-        // 8. Close Webhook connection
         return res.status(200).send('Message Processed');
 
     } catch (error) {
