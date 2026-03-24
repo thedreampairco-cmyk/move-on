@@ -9,11 +9,8 @@ const User = require('../models/User');
 router.post('/', async (req, res) => {
     try {
         const body = req.body;
-
-        console.log("🚨 RAW WEBHOOK HIT:\n", JSON.stringify(body, null, 2));
-
-        // 1. Filter
         const validTypes = ['textMessage', 'extendedTextMessage'];
+        
         if (body.typeWebhook !== 'incomingMessageReceived' || 
             !body.messageData || 
             !validTypes.includes(body.messageData.typeMessage)) {
@@ -21,84 +18,56 @@ router.post('/', async (req, res) => {
         }
 
         const chatId = body.senderData.chatId;
-        
-        // Extract text
-        let userText = "";
-        if (body.messageData.typeMessage === 'textMessage') {
-            userText = body.messageData.textMessageData.textMessage;
-        } else if (body.messageData.typeMessage === 'extendedTextMessage') {
-            userText = body.messageData.extendedTextMessageData.text;
-        }
+        let userText = body.messageData.typeMessage === 'textMessage' 
+            ? body.messageData.textMessageData.textMessage 
+            : body.messageData.extendedTextMessageData.text;
 
-        console.log(`[Move-On Bot] Processing message from ${chatId}: "${userText}"`);
+        console.log(`[Move-On Bot] Received: "${userText}"`);
 
-        // 2. Fetch User & Memory Vault 
-        // 🔥 FIX: Querying by chatId instead of phone
-        let userProfile = await User.findOne({ chatId: chatId });
-        
-        if (!userProfile) {
-            // 🔥 FIX: Saving as chatId instead of phone
-            userProfile = await User.create({
-                chatId: chatId,
-                name: body.senderData.senderName || 'there',
-                gender: 'unknown',
-                memoryTags: {}
+        // 🚨 IMMEDIATELY return 200 so Green API closes the connection
+        res.status(200).send('Message queued');
+
+        // 🔥 RUN THE REST IN THE BACKGROUND
+        (async () => {
+            let userProfile = await User.findOne({ chatId: chatId });
+            if (!userProfile) {
+                userProfile = await User.create({
+                    chatId: chatId, name: body.senderData.senderName || 'stranger', gender: 'male', memoryTags: {}
+                });
+            }
+
+            const currentHour = new Date().getHours(); // Server time (IST)
+            const systemPrompt = buildSystemPrompt({
+                name: userProfile.name, timeContext: currentHour, memoryVault: userProfile.memoryTags || {}
             });
-            console.log(`[Database] Created new profile for ${chatId}`);
-        }
 
-        // 3. Time-Aware Context Injection
-        const currentHour = new Date().getHours();
-        let timeContext = `It is currently ${currentHour}:00. `;
-        if (currentHour >= 8 && currentHour < 18) {
-            timeContext += "Daytime Mode: Act busy, casual, focused on routine (coffee, work, minor inconveniences).";
-        } else if (currentHour >= 20 || currentHour < 2) {
-            timeContext += "Nighttime Mode: Shift tone. Be intimate, deep, slightly vulnerable. Ask philosophical questions.";
-        } else {
-            timeContext += "Evening transition mode: Winding down the day.";
-        }
+            const history = [ { role: 'user', content: userText } ]; 
+            const botReply = await aiResponse.generateCompanionResponse(history, systemPrompt);
 
-        // 4. Build System Prompt & History
-        const systemPrompt = buildSystemPrompt({
-            name: userProfile.name,
-            gender: userProfile.gender,
-            timeContext: timeContext,
-            memoryVault: userProfile.memoryTags || {}
-        });
+            if (botReply) {
+                // ⏱️ THE ARTIFICIAL DELAY (Randomly between 30 seconds and 5 minutes)
+                const minDelay = 30 * 100;
+                const maxDelay = 10 * 1000; // 5 mins
+                const delayMs = Math.floor(Math.random() * (maxDelay - minDelay + 1) + minDelay);
+                
+                console.log(`[Behavioral Engine] Pausing for ${delayMs / 1000} seconds to simulate real typing...`);
+                await new Promise(resolve => setTimeout(resolve, delayMs));
 
-        const history = [ { role: 'user', content: userText } ]; 
+                await greenApi.sendMessage(chatId, botReply);
+                console.log(`✅ [Green API] Sent after delay: "${botReply}"`);
+            }
 
-        // 5. Await Primary AI Response
-        console.log(`[Groq] Generating primary response...`);
-        const botReply = await aiResponse.generateCompanionResponse(history, systemPrompt);
-
-        // 6. Deliver the message via Green API
-        if (botReply) {
-            console.log(`[Green API] Attempting to send reply: "${botReply}"`);
-            await greenApi.sendMessage(chatId, botReply);
-            console.log(`✅ [Green API] Reply successfully sent to ${chatId}`);
-        }
-
-        // 7. FIRE AND FORGET: Shadow Extraction
-        aiResponse.extractMemoryTags(userText, userProfile.memoryTags)
-            .then(async (newTags) => {
-                if (newTags && Object.keys(newTags).length > 0) {
-                    const updatedTags = { ...userProfile.memoryTags, ...newTags };
-                    // 🔥 FIX: Updating by chatId instead of phone
-                    await User.updateOne(
-                        { chatId: chatId }, 
-                        { $set: { memoryTags: updatedTags } }
-                    );
-                    console.log(`[Memory Vault Updated] for ${chatId}:`, newTags);
+            // Shadow Extraction
+            aiResponse.extractMemoryTags(userText, userProfile.memoryTags).then(async (newTags) => {
+                if (newTags) {
+                    await User.updateOne({ chatId: chatId }, { $set: { memoryTags: { ...userProfile.memoryTags, ...newTags } } });
                 }
-            })
-            .catch(err => console.error('[Shadow Extraction Promise Error]:', err.message));
-
-        return res.status(200).send('Message Processed');
+            });
+        })();
 
     } catch (error) {
-        console.error('[Webhook Critical Error]:', error.stack);
-        return res.status(200).send('Error Handled Gracefully');
+        console.error('[Webhook Error]:', error.stack);
+        if (!res.headersSent) res.status(200).send('Error Handled');
     }
 });
 
