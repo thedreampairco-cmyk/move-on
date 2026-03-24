@@ -17,7 +17,7 @@ const aiResponse = {
 
             const completion = await groq.chat.completions.create({
                 messages,
-                model: "llama3-70b-8192", // High reasoning for psychology and tone
+                model: 'llama-3.3-70b-versatile', // High reasoning for psychology and tone
                 temperature: 0.7, // High enough for creativity/wittiness
                 max_tokens: 150, // Keep responses punchy and text-like
             });
