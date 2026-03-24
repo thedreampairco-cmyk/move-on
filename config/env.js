@@ -1,5 +1,7 @@
 // config/env.js
-require('dotenv').config();
+const path = require('path');
+// Force dotenv to look exactly one folder above 'config'
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 module.exports = {
     PORT: process.env.PORT || 3000,
