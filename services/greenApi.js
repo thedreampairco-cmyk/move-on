@@ -1,24 +1,28 @@
 // services/greenApi.js
 const axios = require('axios');
-const env = require('../config/env'); // Assumes you have env configs set up
-
-const GREEN_API_URL = `https://api.green-api.com/waInstance${env.GREEN_API_ID}`;
+const env = require('../config/env');
 
 const greenApi = {
-    /**
-     * Sends a text message to the user.
-     * @param {string} chatId - WhatsApp ID (e.g., "1234567890@c.us")
-     * @param {string} message - The text to send
-     */
     async sendMessage(chatId, message) {
         try {
-            const url = `${GREEN_API_URL}/sendMessage/${env.GREEN_API_TOKEN}`;
-            const payload = { chatId, message };
+            // .trim() acts as a sanitizer to destroy invisible spaces from Render
+            const id = String(env.GREEN_API_ID || '').trim();
+            const token = String(env.GREEN_API_TOKEN || '').trim();
+
+            // 🛑 PASTE YOUR EXACT URL ON THE NEXT LINE:
+            // Example: 'https://7103.api.greenapi.com'
+            const baseUrl = 'https://api.green-api.com'; 
             
+            const url = `${baseUrl}/waInstance${id}/sendMessage/${token}`;
+            
+            // This will log the URL safely so we can prove it's correct
+            console.log(`[Green API Check] Routing to: ${baseUrl}/waInstance${id}/sendMessage/********`);
+
+            const payload = { chatId, message };
             const response = await axios.post(url, payload);
             return response.data;
+            
         } catch (error) {
-            // Log the error but do not throw, preventing server crashes on 500/429s from Green API
             console.error('[GreenAPI Error] Failed to send message:', error.response?.data || error.message);
             return null; 
         }
@@ -26,3 +30,4 @@ const greenApi = {
 };
 
 module.exports = greenApi;
+
