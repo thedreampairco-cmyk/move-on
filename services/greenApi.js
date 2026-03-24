@@ -5,17 +5,22 @@ const env = require('../config/env');
 const greenApi = {
     async sendMessage(chatId, message) {
         try {
-            // .trim() acts as a sanitizer to destroy invisible spaces from Render
-            const id = String(env.GREEN_API_ID || '').trim();
-            const token = String(env.GREEN_API_TOKEN || '').trim();
+            // 🚨 BRUTE FORCE: Grabbing the ID and Token directly from Render's core memory
+            const id = String(process.env.GREEN_API_ID_INSTANCE || process.env.GREEN_API_ID || process.env.GREEN || env.GREEN_API_ID || '').trim();
+            const token = String(process.env.GREEN_API_API_TOKEN_INSTANCE || process.env.GREEN_API_TOKEN || env.GREEN_API_TOKEN || '').trim();
 
-            // 🛑 PASTE YOUR EXACT URL ON THE NEXT LINE:
-            // Example: 'https://7103.api.greenapi.com'
-            const baseUrl = 'https://api.green-api.com'; 
+            if (!id || !token) {
+                console.error("❌ CRITICAL: Green API ID or Token is completely missing from Render!");
+                return null;
+            }
+
+            // 🔥 FIX: Based on your logs, your instance is 7103529867. 
+            // The Green API server MUST be the 7103 subdomain.
+            const baseUrl = 'https://7103.api.greenapi.com'; 
             
             const url = `${baseUrl}/waInstance${id}/sendMessage/${token}`;
             
-            // This will log the URL safely so we can prove it's correct
+            // Safe logging to prove the ID is actually in the URL this time
             console.log(`[Green API Check] Routing to: ${baseUrl}/waInstance${id}/sendMessage/********`);
 
             const payload = { chatId, message };
@@ -30,4 +35,3 @@ const greenApi = {
 };
 
 module.exports = greenApi;
-
