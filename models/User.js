@@ -41,8 +41,10 @@ const userSchema = new mongoose.Schema({
     lastActiveTimestamp: {
         type: Date,
         default: Date.now,
-        index: true // CRITICAL: Allows the cron job to instantly find users inactive for 12+ hours
-    }
+    closenessScore: { type: Number, default: 0 },
+    lastInteraction: { type: Date, default: Date.now }
+}
+
 }, { 
     timestamps: true // Automatically adds createdAt and updatedAt fields
 });
