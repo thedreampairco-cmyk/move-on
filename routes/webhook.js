@@ -4,38 +4,43 @@ const router = express.Router();
 const greenApi = require('../services/greenApi');
 const aiResponse = require('../services/aiResponse');
 const { buildSystemPrompt } = require('../services/buildSystemPrompt');
-const User = require('../models/User'); // Assuming Mongoose model exists
+const User = require('../models/User'); 
 
 router.post('/', async (req, res) => {
     try {
         const body = req.body;
 
+        // 🚨 THE LIE DETECTOR: This will print the exact JSON Green API sends
+        console.log("🚨 RAW WEBHOOK HIT:\n", JSON.stringify(body, null, 2));
+
         // 1. Filter: Process only incoming text messages
         if (body.typeWebhook !== 'incomingMessageReceived' || 
             !body.messageData || 
             body.messageData.typeMessage !== 'textMessage') {
+            console.log("⚠️ Ignored: Event is not an incoming text message.");
             return res.status(200).send('Ignored: Not a text message');
         }
 
         const chatId = body.senderData.chatId;
         const userText = body.messageData.textMessageData.textMessage;
 
-        console.log(`[Move-On Bot] Message from ${chatId}: "${userText}"`);
+        console.log(`[Move-On Bot] Processing message from ${chatId}: "${userText}"`);
 
         // 2. Fetch User & Memory Vault
         let userProfile = await User.findOne({ phone: chatId });
         
-        // Safety Fallback (If bypassing Onboarding for testing)
+        // Safety Fallback (Creates profile if they haven't texted before)
         if (!userProfile) {
             userProfile = await User.create({
                 phone: chatId,
                 name: body.senderData.senderName || 'there',
-                gender: 'unknown', // Ideally set during an onboarding flow
+                gender: 'unknown',
                 memoryTags: {}
             });
+            console.log(`[Database] Created new profile for ${chatId}`);
         }
 
-        // 3. Time-Aware Context Injection (Local IST time assumption)
+        // 3. Time-Aware Context Injection
         const currentHour = new Date().getHours();
         let timeContext = `It is currently ${currentHour}:00. `;
         if (currentHour >= 8 && currentHour < 18) {
@@ -54,23 +59,23 @@ router.post('/', async (req, res) => {
             memoryVault: userProfile.memoryTags || {}
         });
 
-        // (In a full app, you would pull the last 5 messages from a memoryStore here)
         const history = [ { role: 'user', content: userText } ]; 
 
         // 5. Await Primary AI Response
+        console.log(`[Groq] Generating primary response...`);
         const botReply = await aiResponse.generateCompanionResponse(history, systemPrompt);
 
         // 6. Deliver the message via Green API
         if (botReply) {
             await greenApi.sendMessage(chatId, botReply);
+            console.log(`[Green API] Sent reply to ${chatId}`);
         }
 
         // 7. FIRE AND FORGET: Shadow Extraction
-        // Notice there is NO 'await' here. It runs asynchronously in the background.
+        // This runs asynchronously in the background.
         aiResponse.extractMemoryTags(userText, userProfile.memoryTags)
             .then(async (newTags) => {
                 if (newTags && Object.keys(newTags).length > 0) {
-                    // Merge new tags with existing tags
                     const updatedTags = { ...userProfile.memoryTags, ...newTags };
                     await User.updateOne(
                         { phone: chatId }, 
@@ -81,12 +86,12 @@ router.post('/', async (req, res) => {
             })
             .catch(err => console.error('[Shadow Extraction Promise Error]:', err.message));
 
-        // 8. Close Webhook connection immediately to prevent CPU freezing on cloud hosts
+        // 8. Close Webhook connection immediately to prevent timeouts
         return res.status(200).send('Message Processed');
 
     } catch (error) {
         console.error('[Webhook Critical Error]:', error.stack);
-        // Always return 200 to stop Green API from aggressively retrying
+        // Always return 200 to stop Green API from aggressively retrying and spamming your server
         return res.status(200).send('Error Handled Gracefully');
     }
 });
