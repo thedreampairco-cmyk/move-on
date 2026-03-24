@@ -17,15 +17,15 @@ const aiResponse = {
 
             const completion = await groq.chat.completions.create({
                 messages,
-                model: 'llama-3.3-70b-versatile', // High reasoning for psychology and tone
-                temperature: 0.7, // High enough for creativity/wittiness
-                max_tokens: 150, // Keep responses punchy and text-like
+                // 🔥 UPDATED: Active Primary Model
+                model: "llama-3.3-70b-versatile", 
+                temperature: 0.7, 
+                max_tokens: 150, 
             });
 
             return completion.choices[0].message.content;
         } catch (error) {
             console.error('[Groq Error - Primary]:', error.message);
-            // Fallback to prevent dead silence during Groq API limits
             return "my brain is entirely fried right now give me a sec..."; 
         }
     },
@@ -47,19 +47,19 @@ Example: {"sleep_schedule": "late night", "wears": "casual shirts"}
 
             const completion = await groq.chat.completions.create({
                 messages: [{ role: 'user', content: extractionPrompt }],
-                model: "llama3-8b-8192", // Fast, cheap model for data extraction
+                // 🔥 UPDATED: Active Shadow Extraction Model
+                model: "llama-3.1-8b-instant", 
                 temperature: 0.1,
             });
 
             const rawContent = completion.choices[0].message.content.trim();
             if (rawContent === 'null' || !rawContent) return null;
 
-            // Strip potential markdown formatting (```json ... ```)
             const cleanJson = rawContent.replace(/```json/g, '').replace(/```/g, '').trim();
             return JSON.parse(cleanJson);
         } catch (error) {
             console.error('[Groq Error - Shadow Extraction]:', error.message);
-            return null; // Fail silently, it's a background task
+            return null; 
         }
     }
 };
