@@ -1,8 +1,3 @@
-// services/greenApi.js
-// Thin wrapper around Green API's REST endpoints.
-// Handles: sending text messages, setting chat state (typing/recording),
-// and reading incoming webhook payloads.
-
 import axios from "axios";
 import {
   GREEN_API_BASE_URL,
@@ -21,8 +16,7 @@ const greenClient = axios.create({
 
 /**
  * Builds the authenticated URL path for a given Green API method.
- * Green API expects: /waInstance{id}/{method}/{token}
- * @param {string} method  e.g. "sendMessage", "sendTyping"
+ * @param {string} method  e.g. "sendMessage", "showTyping"
  * @returns {string}
  */
 function endpoint(method) {
@@ -30,7 +24,7 @@ function endpoint(method) {
 }
 
 /**
- * Waits for `ms` milliseconds.  Used to simulate natural typing cadence.
+ * Waits for `ms` milliseconds.
  * @param {number} ms
  * @returns {Promise<void>}
  */
@@ -42,58 +36,35 @@ export function sleep(ms) {
 
 /**
  * Sets the WhatsApp chat state for a given chatId.
- * Called immediately when a webhook arrives to simulate a human reading
- * the message before typing a reply.
- *
- * Green API typing endpoint availability varies by plan:
- *   - Paid plans:  POST /sendTyping/{token}  with { chatId, typeOfActivity }
- *   - Free plans:  endpoint returns 403 – silently ignored, bot still works
- *
- * @param {string} chatId  e.g. "919XXXXXXXXX@c.us"
- * @param {"composing"|"recording"|"paused"} state
- * @returns {Promise<void>}
+ * Includes fallback logic for different Green API versions and plan restrictions.
  */
 export async function setChatState(chatId, state = "composing") {
   try {
-    // Some Green API instances use "typeOfActivity", others use "chatAction"
-    await greenClient.post(endpoint("sendTyping"), {
+    // Try standard 'showTyping' first (most common for current Green API)
+    await greenClient.post(endpoint("showTyping"), {
       chatId,
-      typeOfActivity: state === "composing" ? "typing" : state,
+      typeOfActivity: state,
     });
   } catch (err) {
     const status = err.response?.status;
-    if (status === 403) {
-      // Plan doesn't support typing indicators – silently skip, bot works fine
-      return;
+    if (status === 403) return; // Plan restriction - silent skip
+
+    // Fallback: Try legacy 'sendTyping' or 'sendChatAction' if showTyping 404s
+    try {
+      await greenClient.post(endpoint("sendTyping"), {
+        chatId,
+        typeOfActivity: state === "composing" ? "typing" : state,
+      });
+    } catch {
+      // Both failed - non-fatal
     }
-    if (status === 404) {
-      // Instance may use legacy endpoint name – try sendChatAction silently
-      try {
-        await greenClient.post(endpoint("sendChatAction"), {
-          chatId,
-          action: state === "composing" ? "typing" : state,
-        });
-      } catch {
-        // Both endpoints failed – typing indicator unavailable, non-fatal
-      }
-      return;
-    }
-    // Any other error – warn but never throw
-    console.warn(
-      `[greenApi] setChatState failed for ${chatId} (${state}) [${status}]:`,
-      err.response?.data ?? err.message
-    );
   }
 }
 
 // ─── Messaging ────────────────────────────────────────────────────────────────
 
 /**
- * Sends a plain-text WhatsApp message to a chatId.
- *
- * @param {string} chatId
- * @param {string} text
- * @returns {Promise<string|null>} Green API idMessage on success, null on error
+ * Sends a plain-text WhatsApp message.
  */
 export async function sendTextMessage(chatId, text) {
   try {
@@ -112,13 +83,7 @@ export async function sendTextMessage(chatId, text) {
 }
 
 /**
- * Sends a text message with a realistic typing delay before it.
- * The delay is proportional to message length (≈ 40 ms per character),
- * clamped between 1 000 ms and 5 000 ms.
- *
- * @param {string} chatId
- * @param {string} text
- * @returns {Promise<string|null>}
+ * Sends text with a realistic delay proportional to length.
  */
 export async function sendWithTypingDelay(chatId, text) {
   const delay = Math.min(5000, Math.max(1000, text.length * 40));
@@ -130,15 +95,7 @@ export async function sendWithTypingDelay(chatId, text) {
 // ─── Webhook Parsing ──────────────────────────────────────────────────────────
 
 /**
- * Parses the raw JSON body from a Green API webhook notification.
- * Returns a normalized object or null if the payload is not an inbound
- * text message we care about.
- *
- * Supported typeWebhook: "incomingMessageReceived"
- * Supported messageData.typeMessage: "textMessage"
- *
- * @param {object} body  Raw express req.body
- * @returns {{ chatId: string, senderName: string, text: string } | null}
+ * FIXED: Now handles both 'textMessage' and 'extendedTextMessage'.
  */
 export function parseIncomingWebhook(body) {
   if (!body || body.typeWebhook !== "incomingMessageReceived") {
@@ -146,20 +103,26 @@ export function parseIncomingWebhook(body) {
   }
 
   const msgData = body.messageData;
-  if (!msgData || msgData.typeMessage !== "textMessage") {
-    // We only handle plain text for now.  Ignore images, stickers, etc.
-    return null;
+  if (!msgData) return null;
+
+  const type = msgData.typeMessage;
+  let text = "";
+
+  // Support for standard and extended (replies/links/formatted) messages
+  if (type === "textMessage") {
+    text = msgData.textMessageData?.textMessage;
+  } else if (type === "extendedTextMessage") {
+    text = msgData.extendedTextMessageData?.text;
   }
 
   const chatId = body.senderData?.chatId;
   const senderName = body.senderData?.senderName ?? "User";
-  const text = msgData.textMessageData?.textMessage?.trim();
 
   if (!chatId || !text) {
     return null;
   }
 
-  return { chatId, senderName, text };
+  return { chatId, senderName, text: text.trim() };
 }
 
 export default {
