@@ -57,13 +57,21 @@ router.post("/", async (req, res) => {
   // Acknowledge receipt immediately – Green API retries on non-2xx
   res.status(200).json({ status: "received" });
 
+  // 🔥 ADDED LOG 1: Print exactly what type of payload Green API sent
+  console.log("📥 [webhook] Payload Type:", req.body?.typeWebhook || "Unknown");
+
   const parsed = parseIncomingWebhook(req.body);
   if (!parsed) {
     // Not a message we handle (status update, media, etc.) – silently ignore
+    // 🔥 ADDED LOG 2: Show us why it was ignored
+    console.log("🚫 [webhook] Ignored non-text webhook or unhandled format. Raw Data:", JSON.stringify(req.body));
     return;
   }
 
   const { chatId, text: userText } = parsed;
+  
+  // 🔥 ADDED LOG 3: Confirm we successfully parsed a text message
+  console.log(`💬 [webhook] Valid text from ${chatId}: "${userText}"`);
 
   // ── Concurrency guard ──────────────────────────────────────────────────────
   // If we're already generating a reply for this chat, drop this message.
