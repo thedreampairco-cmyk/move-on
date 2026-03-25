@@ -75,8 +75,8 @@ router.post('/', async (req, res) => {
                     );
 
                     // ⏱️ THE ARTIFICIAL DELAY
-                    const minDelay = 15 * 1000; // 15 seconds
-                    const maxDelay = 3 * 60 * 1000; // 3 minutes
+                    const minDelay = 3 * 1000; // 15 seconds
+                    const maxDelay = 30 * 1000; // 3 minutes
                     const delayMs = Math.floor(Math.random() * (maxDelay - minDelay + 1) + minDelay);
 
                     console.log(`[Behavioral Engine] Waiting ${Math.round(delayMs / 1000)}s before replying...`);
