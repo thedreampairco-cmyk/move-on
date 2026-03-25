@@ -1,31 +1,25 @@
 {
-  "name": "move-on",
+  "name": "move-on-bot",
   "version": "1.0.0",
-  "description": "",
-  "main": "cronJobs.js",
+  "description": "Autonomous AI companion for breakup recovery – a nicotine patch for text withdrawal.",
+  "main": "server.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/thedreampairco-cmyk/move-on.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/thedreampairco-cmyk/move-on/issues"
-  },
-  "homepage": "https://github.com/thedreampairco-cmyk/move-on#readme",
   "dependencies": {
-    "axios": "^1.13.6",
-    "dotenv": "^17.3.1",
-    "express": "^5.2.1",
-    "groq": "^5.17.1",
-    "groq-sdk": "^1.1.1",
-    "mongoose": "^9.3.2",
-    "node-cron": "^4.2.1"
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "groq-sdk": "^0.3.3",
+    "mongoose": "^8.4.3",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

@@ -1,85 +1,100 @@
 // services/memoryStore.js
-const User = require('../models/User'); // Assuming Mongoose schema
-const { GROQ_API_KEY } = require('../config/env');
+// Lightweight in-process Map used for ephemeral, per-chat state that
+// does NOT need to survive a process restart (typing locks, pending
+// cold-shoulder delays, etc.).  For persistent data, always use User.js.
 
 /**
- * Fetches the user profile and chat history from MongoDB.
+ * Stores a Set of chatIds that are currently being processed.
+ * Prevents duplicate concurrent responses if webhooks fire rapidly.
  */
-async function getUserProfile(chatId) {
-    let user = await User.findOne({ chatId });
-    if (!user) {
-        user = await User.create({ 
-            chatId, 
-            coreMemories: [], 
-            chatHistory: [],
-            lastActiveTimestamp: Date.now()
-        });
-    }
-    return user;
+const processingLocks = new Map();
+
+/**
+ * Stores ephemeral per-chat flags that should not persist to DB.
+ * Shape: chatId -> { key: value, ... }
+ */
+const ephemeralStore = new Map();
+
+// ─── Processing Lock Helpers ──────────────────────────────────────────────────
+
+/**
+ * Returns true if the chatId is currently locked (i.e. a response
+ * is already being generated for this chat).
+ * @param {string} chatId
+ * @returns {boolean}
+ */
+export function isLocked(chatId) {
+  return processingLocks.get(chatId) === true;
 }
 
 /**
- * Saves a new message to the sliding window history.
+ * Acquires a processing lock for chatId.
+ * @param {string} chatId
  */
-async function saveMessage(chatId, role, content) {
-    await User.updateOne(
-        { chatId },
-        { 
-            $push: { chatHistory: { role, content, timestamp: Date.now() } },
-            $set: { lastActiveTimestamp: Date.now() }
-        }
-    );
+export function acquireLock(chatId) {
+  processingLocks.set(chatId, true);
 }
 
 /**
- * Uses Groq to extract new relationship facts from the recent chat history
- * and appends them to the user's coreMemories array.
+ * Releases the processing lock for chatId.
+ * Should always be called in a finally block.
+ * @param {string} chatId
  */
-async function updateCoreMemories(chatId, recentUserMessage) {
-    try {
-        const user = await User.findOne({ chatId });
-        
-        // Prompt Groq to act as an entity extractor
-        const extractionPrompt = `
-        Analyze this new message from the user: "${recentUserMessage}"
-        Extract any new, permanent facts about the user (e.g., their name, job, pet's name, ex's name, emotional state).
-        Return ONLY a JSON array of strings. If no new facts, return [].
-        Example: ["User has a dog named Max", "User works as a backend dev"]
-        `;
-
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Authorization": `Bearer ${GROQ_API_KEY}`,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                model: "mixtral-8x7b-32768", // Or your preferred Groq model
-                messages: [{ role: "user", content: extractionPrompt }],
-                temperature: 0.1
-            })
-        });
-
-        const data = await response.json();
-        const extractedText = data.choices[0].message.content;
-        
-        // Parse the JSON array
-        const newFacts = JSON.parse(extractedText);
-        
-        if (newFacts && newFacts.length > 0) {
-            await User.updateOne(
-                { chatId },
-                { $addToSet: { coreMemories: { $each: newFacts } } } // $addToSet prevents duplicates
-            );
-            console.log(`[Memory] Updated core memories for ${chatId}:`, newFacts);
-        }
-    } catch (error) {
-        console.error("[Memory Error] Fact extraction failed:", error.message);
-    }
+export function releaseLock(chatId) {
+  processingLocks.delete(chatId);
 }
 
-module.exports = {
-    getUserProfile,
-    saveMessage,
-    updateCoreMemories
+// ─── Ephemeral Store Helpers ──────────────────────────────────────────────────
+
+/**
+ * Sets an ephemeral value for a chat.
+ * @param {string} chatId
+ * @param {string} key
+ * @param {*} value
+ */
+export function setEphemeral(chatId, key, value) {
+  if (!ephemeralStore.has(chatId)) {
+    ephemeralStore.set(chatId, {});
+  }
+  ephemeralStore.get(chatId)[key] = value;
+}
+
+/**
+ * Gets an ephemeral value for a chat. Returns undefined if not set.
+ * @param {string} chatId
+ * @param {string} key
+ * @returns {*}
+ */
+export function getEphemeral(chatId, key) {
+  return ephemeralStore.get(chatId)?.[key];
+}
+
+/**
+ * Deletes an ephemeral key for a chat.
+ * @param {string} chatId
+ * @param {string} key
+ */
+export function deleteEphemeral(chatId, key) {
+  const chatData = ephemeralStore.get(chatId);
+  if (chatData) {
+    delete chatData[key];
+  }
+}
+
+/**
+ * Clears all ephemeral data for a chat (e.g. on session reset).
+ * @param {string} chatId
+ */
+export function clearEphemeral(chatId) {
+  ephemeralStore.delete(chatId);
+}
+
+export default {
+  isLocked,
+  acquireLock,
+  releaseLock,
+  setEphemeral,
+  getEphemeral,
+  deleteEphemeral,
+  clearEphemeral,
 };
