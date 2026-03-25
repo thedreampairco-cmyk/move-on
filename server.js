@@ -72,7 +72,11 @@ async function startServer() {
     // Register scheduled proactive jobs after DB is confirmed live
     registerCronJobs();
 
-    app.listen(PORT, () => {
+   // Health Check Route for your Browser
+app.get('/', (req, res) => {
+    res.status(200).send('🟢 Move-On Bot Server is awake and listening for webhooks!');
+});
+     app.listen(PORT, () => {
       console.log(`
 ╔══════════════════════════════════════════════╗
 ║         Move-On Bot – Server Online           ║
