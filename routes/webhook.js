@@ -1,4 +1,3 @@
-// routes/webhook.js
 const express = require('express');
 const router = express.Router();
 const greenApi = require('../services/greenApi');
@@ -24,70 +23,82 @@ router.post('/', async (req, res) => {
 
         console.log(`[Move-On Bot] Received from ${chatId}: "${userText}"`);
 
-        // 🚨 IMMEDIATELY return 200 to acknowledge receipt
+        // 🚨 IMMEDIATELY return 200 to acknowledge receipt and close the Green API connection
         res.status(200).send('Message queued');
 
         // 🔥 RUN THE CONTEXTUAL LOGIC IN THE BACKGROUND
         (async () => {
-            // 1. Fetch User (Ensure your User model has a 'chatHistory' array field)
-            let userProfile = await User.findOne({ chatId: chatId });
-            if (!userProfile) {
-                userProfile = await User.create({
-                    chatId: chatId, 
-                    name: body.senderData.senderName || 'stranger', 
-                    gender: 'male', 
-                    memoryTags: {},
-                    chatHistory: [] // Initialize history
+            try {
+                // 1. Fetch User (Ensure your User model has a 'chatHistory' array field)
+                let userProfile = await User.findOne({ chatId: chatId });
+                if (!userProfile) {
+                    userProfile = await User.create({
+                        chatId: chatId, 
+                        name: body.senderData.senderName || 'stranger', 
+                        gender: 'male', 
+                        memoryTags: {},
+                        chatHistory: [] // Initialize history
+                    });
+                }
+
+                // 2. Prepare Conversation History
+                let history = userProfile.chatHistory || [];
+                history.push({ role: 'user', content: userText });
+
+                // Keep history lean (last 15 messages) to avoid token bloat
+                const contextWindow = history.slice(-15);
+
+                // 🧹 3. CLEAN THE DATA FOR GROQ API (The Fix)
+                // Strip out Mongoose '_id' and 'timestamp' fields
+                const cleanContext = contextWindow.map(msg => ({
+                    role: msg.role,
+                    content: msg.content
+                }));
+
+                const currentHour = new Date().getHours(); 
+                const systemPrompt = buildSystemPrompt({
+                    name: userProfile.name, 
+                    timeContext: currentHour, 
+                    memoryVault: userProfile.memoryTags || {}
                 });
-            }
 
-            // 2. Prepare Conversation History
-            // We take the existing history and add the current user message
-            let history = userProfile.chatHistory || [];
-            history.push({ role: 'user', content: userText });
+                // 4. Generate Response using the CLEAN Context Window
+                const botReply = await aiResponse.generateCompanionResponse(cleanContext, systemPrompt);
 
-            // Keep history lean (last 15 messages) to avoid token bloat and confusion
-            const contextWindow = history.slice(-15);
-
-            const currentHour = new Date().getHours(); 
-            const systemPrompt = buildSystemPrompt({
-                name: userProfile.name, 
-                timeContext: currentHour, 
-                memoryVault: userProfile.memoryTags || {}
-            });
-
-            // 3. Generate Response using the FULL Context Window
-            const botReply = await aiResponse.generateCompanionResponse(contextWindow, systemPrompt);
-
-            if (botReply) {
-                // 4. Update History with AI's reply and Save to DB
-                history.push({ role: 'assistant', content: botReply });
-                await User.updateOne(
-                    { chatId: chatId }, 
-                    { $set: { chatHistory: history.slice(-20) } } // Store slightly more than we send
-                );
-
-                // ⏱️ THE ARTIFICIAL DELAY (Corrected to match your 5-min intent)
-                const minDelay = 15 * 1000; // 15 seconds
-                const maxDelay = 3 * 60 * 1000; // 3 minutes (5 mins might make users think it crashed)
-                const delayMs = Math.floor(Math.random() * (maxDelay - minDelay + 1) + minDelay);
-
-                console.log(`[Behavioral Engine] Waiting ${Math.round(delayMs / 1000)}s before replying...`);
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-
-                await greenApi.sendMessage(chatId, botReply);
-                console.log(`✅ [Green API] Sent: "${botReply}"`);
-            }
-
-            // 5. Shadow Extraction (Background task)
-            aiResponse.extractMemoryTags(userText, userProfile.memoryTags).then(async (newTags) => {
-                if (newTags) {
+                if (botReply) {
+                    // 5. Update History with AI's reply and Save to DB
+                    history.push({ role: 'assistant', content: botReply });
+                    
                     await User.updateOne(
                         { chatId: chatId }, 
-                        { $set: { memoryTags: { ...userProfile.memoryTags, ...newTags } } }
+                        { $set: { chatHistory: history.slice(-20) } } // Keep a rolling buffer in DB
                     );
+
+                    // ⏱️ THE ARTIFICIAL DELAY
+                    const minDelay = 15 * 1000; // 15 seconds
+                    const maxDelay = 3 * 60 * 1000; // 3 minutes
+                    const delayMs = Math.floor(Math.random() * (maxDelay - minDelay + 1) + minDelay);
+
+                    console.log(`[Behavioral Engine] Waiting ${Math.round(delayMs / 1000)}s before replying...`);
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
+
+                    await greenApi.sendMessage(chatId, botReply);
+                    console.log(`✅ [Green API] Sent: "${botReply}"`);
                 }
-            });
+
+                // 6. Shadow Extraction (Background memory tagging task)
+                aiResponse.extractMemoryTags(userText, userProfile.memoryTags).then(async (newTags) => {
+                    if (newTags) {
+                        await User.updateOne(
+                            { chatId: chatId }, 
+                            { $set: { memoryTags: { ...userProfile.memoryTags, ...newTags } } }
+                        );
+                    }
+                });
+
+            } catch (backgroundError) {
+                console.error('[Background Task Error]:', backgroundError);
+            }
         })();
 
     } catch (error) {
