@@ -22,7 +22,7 @@ const greenClient = axios.create({
 /**
  * Builds the authenticated URL path for a given Green API method.
  * Green API expects: /waInstance{id}/{method}/{token}
- * @param {string} method  e.g. "sendMessage", "showTyping"
+ * @param {string} method  e.g. "sendMessage", "sendTyping"
  * @returns {string}
  */
 function endpoint(method) {
@@ -45,20 +45,42 @@ export function sleep(ms) {
  * Called immediately when a webhook arrives to simulate a human reading
  * the message before typing a reply.
  *
+ * Green API typing endpoint availability varies by plan:
+ *   - Paid plans:  POST /sendTyping/{token}  with { chatId, typeOfActivity }
+ *   - Free plans:  endpoint returns 403 – silently ignored, bot still works
+ *
  * @param {string} chatId  e.g. "919XXXXXXXXX@c.us"
  * @param {"composing"|"recording"|"paused"} state
  * @returns {Promise<void>}
  */
 export async function setChatState(chatId, state = "composing") {
   try {
-    await greenClient.post(endpoint("showTyping"), {
+    // Some Green API instances use "typeOfActivity", others use "chatAction"
+    await greenClient.post(endpoint("sendTyping"), {
       chatId,
-      typeOfActivity: state, // Green API param name
+      typeOfActivity: state === "composing" ? "typing" : state,
     });
   } catch (err) {
-    // Non-fatal – typing indicator failure should never block the response.
+    const status = err.response?.status;
+    if (status === 403) {
+      // Plan doesn't support typing indicators – silently skip, bot works fine
+      return;
+    }
+    if (status === 404) {
+      // Instance may use legacy endpoint name – try sendChatAction silently
+      try {
+        await greenClient.post(endpoint("sendChatAction"), {
+          chatId,
+          action: state === "composing" ? "typing" : state,
+        });
+      } catch {
+        // Both endpoints failed – typing indicator unavailable, non-fatal
+      }
+      return;
+    }
+    // Any other error – warn but never throw
     console.warn(
-      `[greenApi] setChatState failed for ${chatId} (${state}):`,
+      `[greenApi] setChatState failed for ${chatId} (${state}) [${status}]:`,
       err.response?.data ?? err.message
     );
   }

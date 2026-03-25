@@ -38,7 +38,7 @@ export const GREEN_API_BASE_URL = optionalEnv(
 );
 
 // Groq model to use for chat completions
-export const GROQ_MODEL = optionalEnv("GROQ_MODEL", "llama3-70b-8192");
+export const GROQ_MODEL = optionalEnv("GROQ_MODEL", "llama-3.3-70b-versatile");
 
 // Bot's display name – used in system prompt self-references
 export const BOT_NAME = optionalEnv("BOT_NAME", "Alex");
