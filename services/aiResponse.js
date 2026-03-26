@@ -1,49 +1,49 @@
 // services/aiResponse.js
-// Core AI layer: generates bot responses via Groq and silently
-// extracts memory tags from user messages in the background.
+// Core AI layer: generates bot responses via Groq, validates them against
+// Rishika's persona rules, and silently extracts shadow memory.
 
 import Groq from "groq-sdk";
-import {
-  GROQ_API_KEY,
-  GROQ_MODEL,
-  MAX_CONTEXT_MESSAGES,
-} from "../config/env.js";
+import { GROQ_API_KEY, GROQ_MODEL, MAX_CONTEXT_MESSAGES } from "../config/env.js";
 import { buildDynamicSystemPrompt } from "./buildSystemPrompt.js";
-
-// ─── Groq Client ──────────────────────────────────────────────────────────────
+import { validateResponse, getRegenerationInjection } from "./persona.js";
 
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 
-// ─── Context Window Builder ───────────────────────────────────────────────────
+// Max regeneration attempts before accepting the best available response
+const MAX_REGEN_ATTEMPTS = 2;
 
-/**
- * Converts the stored conversationHistory array into the clean
- * { role, content } format expected by Groq, trimmed to MAX_CONTEXT_MESSAGES.
- * Strips all DB metadata (timestamps, _id) so the model receives only
- * a clean dialogue window.
- *
- * @param {Array<{role: string, content: string}>} history
- * @returns {Array<{role: string, content: string}>}
- */
+// ─── Context Window ───────────────────────────────────────────────────────────
+
 function buildContextWindow(history) {
   return history
     .slice(-MAX_CONTEXT_MESSAGES)
     .map(({ role, content }) => ({ role, content }));
 }
 
-// ─── Primary Response Generation ─────────────────────────────────────────────
+// ─── Core Groq Call ───────────────────────────────────────────────────────────
+
+async function callGroq(systemPrompt, contextMessages) {
+  const completion = await groq.chat.completions.create({
+    model: GROQ_MODEL,
+    messages: [
+      { role: "system", content: systemPrompt },
+      ...contextMessages,
+    ],
+    temperature: 0.92,
+    max_tokens: 300,
+    top_p: 0.95,
+    frequency_penalty: 0.4,
+    presence_penalty: 0.3,
+  });
+  return completion.choices?.[0]?.message?.content?.trim() ?? null;
+}
+
+// ─── Primary Response Generation (with persona validation loop) ───────────────
 
 /**
- * Calls the Groq API and returns the raw bot response string.
- * All persona rules, phase logic, and memory are injected via the system prompt.
- *
- * @param {object} params
- * @param {string}  params.userText          The latest user message
- * @param {Array}   params.conversationHistory Stored history from User doc
- * @param {number}  params.daysActive
- * @param {boolean} params.coldShoulderActive
- * @param {object}  params.memoryMap         { key: value } memory tags
- * @returns {Promise<string>} Raw LLM response text
+ * Generates a Rishika-compliant response.
+ * Validates output against persona rules and regenerates if violations found.
+ * Falls back gracefully after MAX_REGEN_ATTEMPTS.
  */
 export async function generateRawResponse({
   userText,
@@ -52,87 +52,96 @@ export async function generateRawResponse({
   coldShoulderActive,
   memoryMap,
 }) {
-  const systemPrompt = buildDynamicSystemPrompt({
+  let systemPrompt = buildDynamicSystemPrompt({
     daysActive,
     coldShoulderActive,
     memoryMap,
   });
 
-  // Build context window from history (already includes the new user message
-  // appended by the webhook handler BEFORE this call).
   const contextMessages = buildContextWindow(conversationHistory);
+  let lastResponse = null;
 
-  let completion;
-  try {
-    completion = await groq.chat.completions.create({
-      model: GROQ_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...contextMessages,
-      ],
-      temperature: 0.92,      // High creativity while staying coherent
-      max_tokens: 300,        // Force brevity – no walls of text
-      top_p: 0.95,
-      frequency_penalty: 0.4, // Reduce repetitive phrases
-      presence_penalty: 0.3,  // Encourage topical variety
-    });
-  } catch (err) {
-    console.error("[aiResponse] Groq API error:", err.message);
-    // Fallback: generic human-like shrug so the chat doesn't die silently
-    return "ugh sorry my brain is completely fried rn. give me a sec";
+  for (let attempt = 1; attempt <= MAX_REGEN_ATTEMPTS + 1; attempt++) {
+    let raw;
+    try {
+      raw = await callGroq(systemPrompt, contextMessages);
+    } catch (err) {
+      console.error(`[aiResponse] Groq API error (attempt ${attempt}):`, err.message);
+      // Return a Rishika-flavoured fallback so the chat never dies silently
+      return "arey yaar mera dimag aaj kaam nahi kar raha. ek second de.";
+    }
+
+    if (!raw) {
+      return "kuch toh hua... main yahan hoon, bas thodi si der ke liye gayi thi.";
+    }
+
+    // ── Persona validation ────────────────────────────────────────────────
+    const check = validateResponse(raw);
+
+    if (check.clean) {
+      if (attempt > 1) {
+        console.log(`[aiResponse] Persona validated on attempt ${attempt}`);
+      }
+      return raw;
+    }
+
+    // Violation found
+    console.warn(
+      `[aiResponse] Persona violation (attempt ${attempt}/${MAX_REGEN_ATTEMPTS + 1}): ${check.reason}`
+    );
+
+    if (attempt <= MAX_REGEN_ATTEMPTS) {
+      // Inject correction into system prompt and retry
+      const injection = getRegenerationInjection(check.reason, raw);
+      systemPrompt = injection + "\n\n" + systemPrompt;
+    } else {
+      // Exhausted retries – return last response as best-effort
+      console.error("[aiResponse] Max regen attempts reached. Sending best-effort response.");
+      lastResponse = raw;
+    }
+
+    lastResponse = raw;
   }
 
-  const raw = completion.choices?.[0]?.message?.content?.trim();
-
-  if (!raw) {
-    return "hold on i completely lost my train of thought lol";
-  }
-
-  return raw;
+  return lastResponse ?? "kuch hua... par hum yahan hain.";
 }
 
 // ─── Shadow Memory Extraction ─────────────────────────────────────────────────
 
 /**
- * Silently calls the Groq API in the background to extract structured
- * facts from the user's latest message and any recent history.
- * Returns a flat { key: value } object of new or updated memory tags.
- * Returns {} if nothing useful is found or if the call fails.
- *
- * This function is called with .catch() suppressed – it must never
- * block or crash the main response pipeline.
- *
- * @param {string} userText
- * @param {Array}  conversationHistory
- * @returns {Promise<object>} e.g. { morning_routine: "gym at 7am", pet: "a dog named Bruno" }
+ * Silently extracts structured facts about the user from their messages.
+ * Rishika-aware: includes context about who she is so the extractor
+ * doesn't confuse her details with the user's.
+ * Returns {} on failure – never blocks the main pipeline.
  */
 export async function extractShadowMemory(userText, conversationHistory) {
-  // Only use the last 6 messages for the extraction call to keep it cheap
   const recentHistory = conversationHistory
     .slice(-6)
-    .map(({ role, content }) => `${role}: ${content}`)
+    .map(({ role, content }) => {
+      // Strip the [proactive:...] prefix from assistant messages before sending
+      const cleanContent = content.replace(/^\[proactive:[^\]]+\]\s*/, "");
+      return `${role}: ${cleanContent}`;
+    })
     .join("\n");
 
   const extractionPrompt = `
-You are a silent memory extractor. Your ONLY job is to read the conversation below
-and identify concrete, personal facts about the USER (not the assistant).
+You are a silent memory extractor. Extract concrete facts about the USER ONLY
+(not about the assistant named Rishika Singh).
 
 Extract facts like:
 - daily routines (morning_routine, gym_schedule, work_schedule)
 - food preferences (favourite_food, hates_food)
-- hobbies and interests (hobby, sport, music_taste, show_watching)
-- pets (pet)
-- work or study context (job, studies_at)
-- emotional patterns (gets_anxious_about, love_language)
-- people they mention frequently (best_friend, sibling, etc.)
-- locations they reference (lives_in, favourite_place)
-- the ex (ex_name, ex_relationship_length) – only if explicitly stated
+- hobbies (hobby, sport, music_taste, show_watching)
+- pets, work/study context, emotional patterns
+- people they mention (best_friend, sibling)
+- locations (lives_in, favourite_place)
+- the ex (ex_name, breakup_reason) – only if explicitly stated
 
 RULES:
-- Return ONLY a valid JSON object. No explanation, no markdown, no preamble.
-- Use snake_case keys. Keep values short (under 15 words).
-- If nothing concrete can be extracted, return exactly: {}
-- DO NOT invent or assume. Only extract what is explicitly stated.
+- Return ONLY valid JSON. No markdown, no explanation, no backticks.
+- snake_case keys. Values under 15 words.
+- If nothing concrete found, return exactly: {}
+- DO NOT invent or assume.
 
 RECENT CONVERSATION:
 ${recentHistory}
@@ -145,30 +154,20 @@ ${userText}
     const completion = await groq.chat.completions.create({
       model: GROQ_MODEL,
       messages: [{ role: "user", content: extractionPrompt }],
-      temperature: 0.1, // Near-deterministic for structured extraction
+      temperature: 0.1,
       max_tokens: 200,
     });
 
     const raw = completion.choices?.[0]?.message?.content?.trim() ?? "{}";
-
-    // Strip any accidental markdown code fences
     const cleaned = raw.replace(/```json|```/gi, "").trim();
     const parsed = JSON.parse(cleaned);
 
-    // Validate: must be a plain object
-    if (typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-
+    if (typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed;
   } catch (err) {
-    // Silently swallow – memory extraction is best-effort
     console.warn("[aiResponse] extractShadowMemory failed:", err.message);
     return {};
   }
 }
 
-export default {
-  generateRawResponse,
-  extractShadowMemory,
-};
+export default { generateRawResponse, extractShadowMemory };
