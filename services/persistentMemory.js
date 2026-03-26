@@ -2,56 +2,40 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // PERSISTENT MEMORY ENGINE
 //
-// Problem it solves:
-//   When you update and redeploy the bot, Node.js restarts. Any in-memory
-//   state (Maps, arrays, variables) is wiped. This service ensures ALL
-//   conversation history, memory tags, and relationship state live ONLY in
-//   MongoDB — so Rishika remembers everything across every code update,
-//   restart, crash, or server migration.
+// Survives all code updates, server restarts, and crashes.
+// All reads/writes go directly to MongoDB — zero reliance on in-process state.
 //
-// Architecture:
-//   • NO in-memory caching of conversations (would go stale on restart)
-//   • Every read goes to MongoDB. Every write goes to MongoDB immediately.
-//   • History is stored as an append-only log with a rolling cap.
-//   • A separate `MemorySnapshot` collection stores monthly archives so
-//     history older than 30 days is not lost even when the rolling cap trims.
-//   • `loadFullContext(chatId)` is the single entry point for the AI pipeline.
+// memoryTags format: plain object { key: value } stored as BSON Object.
+// We NEVER use dot-notation $set on memoryTags because old documents may
+// still have it as an array until migration runs. Instead we always:
+//   1. Read current memoryTags (any format)
+//   2. Merge in JS (safe, format-agnostic)
+//   3. $set the whole memoryTags object at once
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import mongoose from "mongoose";
 import User from "../models/User.js";
 import { MAX_CONTEXT_MESSAGES } from "../config/env.js";
 
-// ─── Memory Snapshot Schema ───────────────────────────────────────────────────
-// Archives conversation batches older than the rolling window.
-// Queried by Rishika's shadow memory but NOT sent to the LLM context window
-// (would exceed token limits). Used only for fact extraction lookups.
+// ─── MemorySnapshot Schema ────────────────────────────────────────────────────
 
 const MemorySnapshotSchema = new mongoose.Schema(
   {
-    chatId: { type: String, required: true, index: true },
-
-    // Month this batch belongs to: "2025-06"
+    chatId:   { type: String, required: true, index: true },
     monthKey: { type: String, required: true },
-
-    // The archived message batch
     messages: [
       {
         role:      { type: String, enum: ["user", "assistant"], required: true },
         content:   { type: String, required: true },
-        timestamp: { type: Date,   required: true },
+        timestamp: { type: Date, required: true },
       },
     ],
-
-    // Key facts extracted from this batch (so we don't re-query)
-    extractedFacts: { type: Map, of: String, default: {} },
-
-    archivedAt: { type: Date, default: Date.now },
+    extractedFacts: { type: Object, default: {} },
+    archivedAt:     { type: Date, default: Date.now },
   },
   { collection: "memory_snapshots" }
 );
 
-// Compound index: one snapshot document per chatId per month
 MemorySnapshotSchema.index({ chatId: 1, monthKey: 1 }, { unique: true });
 
 const MemorySnapshot =
@@ -60,45 +44,94 @@ const MemorySnapshot =
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-// How many messages to keep in the hot (User.conversationHistory) window
-const HOT_WINDOW_SIZE = MAX_CONTEXT_MESSAGES * 2; // default: 30
+const HOT_WINDOW_SIZE  = MAX_CONTEXT_MESSAGES * 2; // 30 messages kept hot
+const LLM_CONTEXT_SIZE = MAX_CONTEXT_MESSAGES;      // 15 sent to LLM
+const ARCHIVE_THRESHOLD = HOT_WINDOW_SIZE + 10;     // archive trigger at 40
 
-// How many messages to send to the LLM per request (subset of hot window)
-const LLM_CONTEXT_SIZE = MAX_CONTEXT_MESSAGES; // default: 15
+// ─── Internal: format-safe memoryTags reader ─────────────────────────────────
 
-// Minimum messages before we consider archiving old ones
-const ARCHIVE_THRESHOLD = HOT_WINDOW_SIZE + 10;
+/**
+ * Reads the raw memoryTags field from a MongoDB document and returns
+ * a clean plain object regardless of whether it was stored as:
+ *   • A plain object / Mongoose Map  { key: value }      ← new format
+ *   • An array of tag objects        [{key, value, ...}] ← legacy format
+ *
+ * This is the ONLY place that knows about both formats.
+ *
+ * @param {*} rawField  The raw value of doc.memoryTags
+ * @returns {object}    Clean { key: value } object
+ */
+function normalizeMemoryTags(rawField) {
+  if (!rawField) return {};
+
+  // Mongoose Map → plain object
+  if (rawField instanceof Map) {
+    return Object.fromEntries(rawField);
+  }
+
+  // Legacy array [{key, value, extractedAt}, ...]
+  if (Array.isArray(rawField)) {
+    const obj = {};
+    for (const tag of rawField) {
+      if (tag?.key && tag?.value) {
+        obj[sanitizeKey(String(tag.key))] = String(tag.value).trim();
+      }
+    }
+    return obj;
+  }
+
+  // Plain object (already migrated)
+  if (typeof rawField === "object") {
+    const obj = {};
+    for (const [k, v] of Object.entries(rawField)) {
+      if (k && v && typeof v === "string") {
+        obj[sanitizeKey(k)] = v.trim();
+      }
+    }
+    return obj;
+  }
+
+  return {};
+}
+
+/**
+ * Merges new tags into an existing memoryTags object.
+ * New values overwrite old ones for the same key.
+ * @param {object} existing
+ * @param {object} incoming
+ * @returns {object}
+ */
+function mergeMemoryTags(existing, incoming) {
+  const merged = { ...existing };
+  for (const [key, value] of Object.entries(incoming)) {
+    const clean = sanitizeKey(key);
+    if (clean && typeof value === "string" && value.trim()) {
+      merged[clean] = value.trim();
+    }
+  }
+  return merged;
+}
 
 // ─── Core Read: loadFullContext ───────────────────────────────────────────────
 
 /**
- * THE single entry point for the AI pipeline.
- * Loads everything Rishika needs to reply from MongoDB.
- *
- * Returns:
- *   {
- *     user,              // Mongoose User document (already fetched, ready to .save())
- *     recentHistory,     // Last LLM_CONTEXT_SIZE messages for the AI call
- *     memoryMap,         // All extracted memory tags { key: value }
- *     daysActive,        // Computed from user.createdAt
- *     coldShoulderActive // Boolean
- *   }
+ * Loads everything Rishika needs to reply, from MongoDB.
+ * Auto-creates the user document on first message.
  *
  * @param {string} chatId
- * @returns {Promise<object>}
+ * @returns {Promise<{ user, recentHistory, memoryMap, daysActive, coldShoulderActive }>}
  */
 export async function loadFullContext(chatId) {
-  // findOneAndUpdate with upsert so first-time users are auto-created
+  // Use findOneAndUpdate upsert so first-timers are created atomically
   let user = await User.findOneAndUpdate(
     { chatId },
     { $setOnInsert: { chatId, createdAt: new Date() } },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
 
-  // Trim hot window if it somehow grew beyond cap (safety net)
+  // Safety net: archive if hot window overflowed
   if (user.conversationHistory.length > ARCHIVE_THRESHOLD) {
     await archiveOldMessages(user);
-    // Re-fetch after archive mutation
     user = await User.findOne({ chatId });
   }
 
@@ -106,90 +139,88 @@ export async function loadFullContext(chatId) {
     .slice(-LLM_CONTEXT_SIZE)
     .map(({ role, content }) => ({ role, content }));
 
+  // Normalize memoryTags regardless of stored format
+  const memoryMap = normalizeMemoryTags(user.memoryTags);
+
   return {
     user,
     recentHistory,
-    memoryMap:          user.getMemoryMap(),
+    memoryMap,
     daysActive:         user.daysActive,
-    coldShoulderActive: user.coldShoulderActive,
+    coldShoulderActive: !!user.coldShoulderActive,
   };
 }
 
 // ─── Core Write: saveInteraction ─────────────────────────────────────────────
 
 /**
- * Atomically appends both sides of an interaction (user message + bot reply)
- * to the conversation history and persists memory tag updates.
+ * Atomically saves both sides of an interaction to MongoDB.
  *
- * Called AFTER the bot response is generated and ready to send.
- * Using $push with $slice ensures the document never grows beyond cap
- * even if two requests race.
+ * memoryTags strategy (crash-safe, format-agnostic):
+ *   1. Read current raw memoryTags from DB via lean query
+ *   2. normalizeMemoryTags() → clean object regardless of format
+ *   3. mergeMemoryTags()     → merge new extracted tags in JS
+ *   4. $set whole memoryTags → single atomic write, no dot-notation
+ *
+ * This works on both old-format (array) and new-format (object) documents.
  *
  * @param {string} chatId
  * @param {string} userText
  * @param {string} botText
- * @param {object} newMemoryTags   { key: value } extracted by shadow memory
- * @param {object} stateUpdates    Optional field overrides (coldShoulderActive, etc.)
- * @returns {Promise<void>}
+ * @param {object} newMemoryTags  { key: value } from shadow memory extraction
+ * @param {object} stateUpdates   Optional overrides (coldShoulderActive, etc.)
  */
 export async function saveInteraction(
   chatId,
   userText,
   botText,
   newMemoryTags = {},
-  stateUpdates = {}
+  stateUpdates  = {}
 ) {
   const now = new Date();
 
-  // Build the two new message objects
-  const userMsg = { role: "user",      content: userText, timestamp: now };
-  const botMsg  = { role: "assistant", content: botText,  timestamp: now };
+  // ── Step 1: Fetch raw current tags (lean = plain JS, no Mongoose wrapping)
+  const rawDoc = await User.findOne({ chatId }, { memoryTags: 1 }).lean();
+  const existingTags = normalizeMemoryTags(rawDoc?.memoryTags);
 
-  // Build $set for memory tag upserts
-  // MongoDB Map fields use dot-notation: memoryTags.key_name
-  const memorySetOps = {};
-  for (const [key, value] of Object.entries(newMemoryTags)) {
-    if (typeof value === "string" && value.trim()) {
-      memorySetOps[`memoryTags.${sanitizeKey(key)}`] = value.trim();
-    }
-  }
+  // ── Step 2: Merge new tags into existing
+  const mergedTags = mergeMemoryTags(existingTags, newMemoryTags);
 
+  // ── Step 3: Single atomic update — messages + tags + state
   await User.findOneAndUpdate(
     { chatId },
     {
-      // Append messages and hard-cap at HOT_WINDOW_SIZE using $push + $slice
       $push: {
         conversationHistory: {
-          $each:  [userMsg, botMsg],
+          $each:  [
+            { role: "user",      content: userText, timestamp: now },
+            { role: "assistant", content: botText,  timestamp: now },
+          ],
           $slice: -HOT_WINDOW_SIZE,
         },
       },
-      // Increment message count
       $inc: { messageCount: 1 },
-      // Update timestamps and state
       $set: {
         last_message_timestamp: now,
-        coldShoulderActive: false, // Always reset after a real reply
+        coldShoulderActive:     false,
+        memoryTags:             mergedTags, // whole object, never dot-notation
         ...stateUpdates,
-        ...memorySetOps,
       },
     },
-    { upsert: true, new: true }
+    { upsert: true }
   );
 }
 
 // ─── Proactive Message Saver ──────────────────────────────────────────────────
 
 /**
- * Saves a proactive (bot-initiated) message.
- * Only appends the assistant side – no user message.
- *
+ * Saves a bot-initiated proactive message (no user side).
  * @param {string} chatId
  * @param {string} botText
- * @param {string} slotName   e.g. "morning_anchor"
+ * @param {string} slotName  e.g. "morning_anchor"
  */
 export async function saveProactiveMessage(chatId, botText, slotName) {
-  const now = new Date();
+  const now     = new Date();
   const content = `[proactive:${slotName}] ${botText}`;
 
   await User.findOneAndUpdate(
@@ -202,8 +233,8 @@ export async function saveProactiveMessage(chatId, botText, slotName) {
         },
       },
       $set: {
-        last_message_timestamp:  now,
-        proactive_last_date:     now.toISOString().slice(0, 10),
+        last_message_timestamp: now,
+        proactive_last_date:    now.toISOString().slice(0, 10),
       },
       $inc: { proactive_sent_today: 1 },
     },
@@ -211,27 +242,50 @@ export async function saveProactiveMessage(chatId, botText, slotName) {
   );
 }
 
+// ─── Persist Memory Tags (standalone) ────────────────────────────────────────
+
+/**
+ * Updates only the memoryTags field for a chatId.
+ * Format-safe: reads current tags, merges, writes whole object.
+ * @param {string} chatId
+ * @param {object} tags  { key: value }
+ */
+export async function persistMemoryTags(chatId, tags) {
+  if (!tags || Object.keys(tags).length === 0) return;
+
+  const rawDoc = await User.findOne({ chatId }, { memoryTags: 1 }).lean();
+  if (!rawDoc) return;
+
+  const existing = normalizeMemoryTags(rawDoc.memoryTags);
+  const merged   = mergeMemoryTags(existing, tags);
+
+  await User.findOneAndUpdate(
+    { chatId },
+    { $set: { memoryTags: merged } },
+    { upsert: true }
+  );
+
+  console.log(
+    `[persistentMemory] Tags updated for ${chatId}: ${Object.keys(tags).join(", ")}`
+  );
+}
+
 // ─── Archive Old Messages ─────────────────────────────────────────────────────
 
 /**
- * Archives messages older than the hot window to MemorySnapshot.
- * Called automatically when the hot window exceeds ARCHIVE_THRESHOLD.
- * Uses MongoDB upsert with $push to append to the monthly batch document.
- *
+ * Moves messages older than HOT_WINDOW_SIZE to MemorySnapshot collection.
+ * Called automatically when hot window overflows.
  * @param {object} user  Mongoose User document
- * @returns {Promise<void>}
  */
 async function archiveOldMessages(user) {
   const history = user.conversationHistory;
   if (history.length <= HOT_WINDOW_SIZE) return;
 
-  // Everything older than the last HOT_WINDOW_SIZE messages gets archived
   const toArchive = history.slice(0, history.length - HOT_WINDOW_SIZE);
   const toKeep    = history.slice(-HOT_WINDOW_SIZE);
-
   if (toArchive.length === 0) return;
 
-  // Group by month key for the archive document
+  // Group by month
   const byMonth = {};
   for (const msg of toArchive) {
     const ts  = msg.timestamp ? new Date(msg.timestamp) : new Date();
@@ -240,7 +294,6 @@ async function archiveOldMessages(user) {
     byMonth[key].push({ role: msg.role, content: msg.content, timestamp: ts });
   }
 
-  // Write each month batch to MemorySnapshot
   for (const [monthKey, messages] of Object.entries(byMonth)) {
     await MemorySnapshot.findOneAndUpdate(
       { chatId: user.chatId, monthKey },
@@ -252,163 +305,115 @@ async function archiveOldMessages(user) {
     );
   }
 
-  // Trim the user's hot window in-place
   user.conversationHistory = toKeep;
   await user.save();
 
   console.log(
-    `[persistentMemory] Archived ${toArchive.length} messages for ${user.chatId}. ` +
-    `Hot window: ${toKeep.length} messages.`
+    `[persistentMemory] Archived ${toArchive.length} msgs for ${user.chatId}. Hot: ${toKeep.length}`
   );
 }
 
-// ─── Memory Hydration ─────────────────────────────────────────────────────────
+// ─── Hydrate Full Memory ──────────────────────────────────────────────────────
 
 /**
- * Looks up a user's full memory profile across both the hot window and
- * all archived snapshots. Used by the shadow memory extractor to build
- * a richer fact base than just recent messages.
- *
+ * Returns hot + archived messages and normalised memoryMap.
+ * Used for deep context queries and debug reports.
  * @param {string} chatId
- * @returns {Promise<{ recentMessages: Array, archivedMessages: Array, memoryMap: object }>}
  */
 export async function hydrateFullMemory(chatId) {
   const user = await User.findOne({ chatId });
   if (!user) return { recentMessages: [], archivedMessages: [], memoryMap: {} };
 
-  // Fetch ALL archived snapshots for this chatId, sorted oldest first
-  const snapshots = await MemorySnapshot.find({ chatId }).sort({ monthKey: 1 });
+  const snapshots        = await MemorySnapshot.find({ chatId }).sort({ monthKey: 1 });
   const archivedMessages = snapshots.flatMap((s) => s.messages);
 
   return {
     recentMessages:  user.conversationHistory.map(({ role, content }) => ({ role, content })),
     archivedMessages,
-    memoryMap:       user.getMemoryMap(),
+    memoryMap: normalizeMemoryTags(user.memoryTags),
   };
-}
-
-/**
- * Persists newly extracted memory tags to the MemorySnapshot's extractedFacts
- * AND to the User document. Ensures tags survive even if the hot window
- * is later trimmed.
- *
- * @param {string} chatId
- * @param {object} tags  { key: value }
- */
-export async function persistMemoryTags(chatId, tags) {
-  if (!tags || Object.keys(tags).length === 0) return;
-
-  const user = await User.findOne({ chatId });
-  if (!user) return;
-
-  let changed = false;
-  for (const [key, value] of Object.entries(tags)) {
-    if (typeof value === "string" && value.trim()) {
-      user.upsertMemoryTag(sanitizeKey(key), value.trim());
-      changed = true;
-    }
-  }
-
-  if (changed) await user.save();
 }
 
 // ─── Relationship State ───────────────────────────────────────────────────────
 
 /**
- * Returns a lightweight summary of where the relationship currently stands.
- * Used by cronJobs.js to build proactive messages without loading full history.
- *
+ * Lightweight state summary for cron jobs.
  * @param {string} chatId
- * @returns {Promise<{ daysActive: number, phase: number, lastSeen: Date|null, memoryMap: object }>}
  */
 export async function getRelationshipState(chatId) {
   const user = await User.findOne({ chatId }, {
-    createdAt: 1,
-    last_message_timestamp: 1,
-    memoryTags: 1,
-    proactive_sent_today: 1,
-    proactive_last_date: 1,
-  });
+    createdAt: 1, last_message_timestamp: 1, memoryTags: 1,
+    proactive_sent_today: 1, proactive_last_date: 1,
+  }).lean();
 
   if (!user) return { daysActive: 0, phase: 1, lastSeen: null, memoryMap: {} };
 
-  const msActive  = Date.now() - new Date(user.createdAt).getTime();
-  const daysActive = Math.floor(msActive / (1000 * 60 * 60 * 24));
+  const daysActive = Math.floor(
+    (Date.now() - new Date(user.createdAt).getTime()) / (1000 * 60 * 60 * 24)
+  );
 
-  let phase = 1;
-  if (daysActive > 21) phase = 4;
-  else if (daysActive > 14) phase = 3;
-  else if (daysActive > 7)  phase = 2;
+  const phase =
+    daysActive > 21 ? 4 :
+    daysActive > 14 ? 3 :
+    daysActive > 7  ? 2 : 1;
 
   return {
     daysActive,
     phase,
     lastSeen:  user.last_message_timestamp,
-    memoryMap: user.getMemoryMap(),
+    memoryMap: normalizeMemoryTags(user.memoryTags),
   };
 }
 
-// ─── Debug / Admin Helpers ────────────────────────────────────────────────────
+// ─── Debug / Admin ────────────────────────────────────────────────────────────
 
-/**
- * Returns a full memory report for a chatId.
- * Useful for debugging: node -e "import('./services/persistentMemory.js').then(m => m.debugMemoryReport('ID'))"
- *
- * @param {string} chatId
- */
 export async function debugMemoryReport(chatId) {
-  const user = await User.findOne({ chatId });
+  const user      = await User.findOne({ chatId }).lean();
   if (!user) { console.log("User not found:", chatId); return; }
 
-  const snapshots = await MemorySnapshot.find({ chatId }).sort({ monthKey: 1 });
-  const totalArchived = snapshots.reduce((n, s) => n + s.messages.length, 0);
+  const snapshots      = await MemorySnapshot.find({ chatId }).sort({ monthKey: 1 });
+  const totalArchived  = snapshots.reduce((n, s) => n + s.messages.length, 0);
+  const memoryMap      = normalizeMemoryTags(user.memoryTags);
+  const daysActive     = Math.floor((Date.now() - new Date(user.createdAt)) / 86400000);
 
-  console.log("\n══════════════════════════════════════");
+  const historyArr = Array.isArray(user.conversationHistory) ? user.conversationHistory : [];
+
+  console.log("\n══════════════════════════════════════════");
   console.log(`  MEMORY REPORT: ${chatId}`);
-  console.log("══════════════════════════════════════");
-  console.log(`  Days active     : ${user.daysActive}`);
-  console.log(`  Messages total  : ${user.messageCount}`);
-  console.log(`  Hot window      : ${user.conversationHistory.length} messages`);
-  console.log(`  Archived        : ${totalArchived} messages across ${snapshots.length} month(s)`);
-  console.log(`  Memory tags     : ${user.memoryTags.length}`);
+  console.log("══════════════════════════════════════════");
+  console.log(`  Days active   : ${daysActive}`);
+  console.log(`  Messages total: ${user.messageCount ?? "?"}`);
+  console.log(`  Hot window    : ${historyArr.length} messages`);
+  console.log(`  Archived      : ${totalArchived} msgs across ${snapshots.length} month(s)`);
+  console.log(`  Memory tags   : ${Object.keys(memoryMap).length}`);
+  console.log(`  memoryTags fmt: ${Array.isArray(user.memoryTags) ? "LEGACY ARRAY ⚠️" : "Object ✓"}`);
   console.log("\n  Memory Tags:");
-  user.memoryTags.forEach((t) => console.log(`    ${t.key}: ${t.value}`));
+  for (const [k, v] of Object.entries(memoryMap)) {
+    console.log(`    ${k}: ${v}`);
+  }
   console.log("\n  Last 5 messages:");
-  user.conversationHistory.slice(-5).forEach((m) =>
-    console.log(`    [${m.role}] ${m.content.slice(0, 80)}`)
+  historyArr.slice(-5).forEach((m) =>
+    console.log(`    [${m.role}] ${String(m.content).slice(0, 80)}`)
   );
-  console.log("══════════════════════════════════════\n");
+  console.log("══════════════════════════════════════════\n");
 }
 
-/**
- * Exports a full conversation dump to JSON.
- * Run: node -e "..."  to inspect before/after a code update.
- *
- * @param {string} chatId
- * @returns {Promise<object>}
- */
 export async function exportConversation(chatId) {
   const { recentMessages, archivedMessages, memoryMap } = await hydrateFullMemory(chatId);
   return {
     chatId,
-    exportedAt:  new Date().toISOString(),
+    exportedAt:    new Date().toISOString(),
     memoryMap,
     totalMessages: recentMessages.length + archivedMessages.length,
-    archived:    archivedMessages,
-    recent:      recentMessages,
+    archived:      archivedMessages,
+    recent:        recentMessages,
   };
 }
 
 // ─── Internal Helpers ─────────────────────────────────────────────────────────
 
-/**
- * Sanitizes a memory tag key to be safe for MongoDB dot-notation field paths.
- * Removes characters that would break $set paths.
- * @param {string} key
- * @returns {string}
- */
 function sanitizeKey(key) {
-  return key
+  return String(key)
     .toLowerCase()
     .replace(/[^a-z0-9_]/g, "_")
     .replace(/__+/g, "_")
@@ -419,8 +424,8 @@ export default {
   loadFullContext,
   saveInteraction,
   saveProactiveMessage,
-  hydrateFullMemory,
   persistMemoryTags,
+  hydrateFullMemory,
   getRelationshipState,
   debugMemoryReport,
   exportConversation,
