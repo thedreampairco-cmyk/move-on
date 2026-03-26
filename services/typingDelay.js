@@ -87,7 +87,7 @@ export function scoreToPhase(score) {
 export function getInitialReplyDelayRange(score) {
   const phase = scoreToPhase(score);
   const ranges = {
-    1: { minMs: 30 * 60_000,  maxMs: 180 * 60_000, label: "30 min–3 hr"  },
+    1: { minMs: 3_000,  maxMs: 30_000, label: "3–30 sec (TEST)"  },
     2: { minMs: 15 * 60_000,  maxMs:  45 * 60_000, label: "15–45 min"    },
     3: { minMs:  5 * 60_000,  maxMs:  10 * 60_000, label: "5–10 min"     },
     4: { minMs:  1 * 60_000,  maxMs:   5 * 60_000, label: "1–5 min"      },
