@@ -1,88 +1,46 @@
 // routes/webhook.js
-// Express router that receives Green API webhook notifications.
-// Handles the full inbound message pipeline:
-//   1. Parse & validate the payload
-//   2. Immediately trigger "composing" chat state
-//   3. Upsert user in MongoDB
-//   4. Apply Cold Shoulder detection
-//   5. Append to conversation history
-//   6. Fire shadow memory extraction (non-blocking)
-//   7. Generate & humanize bot response
-//   8. Persist updated user doc
+// Webhook handler – fully wired to persistentMemory for atomic, crash-safe writes.
+// History and memory tags survive all code updates and server restarts.
 
 import express from "express";
-import User from "../models/User.js";
 import { parseIncomingWebhook, setChatState, sleep } from "../services/greenApi.js";
 import { generateRawResponse, extractShadowMemory } from "../services/aiResponse.js";
 import { humanizeAndSend } from "../services/humanizer.js";
 import { isLocked, acquireLock, releaseLock } from "../services/memoryStore.js";
-import { COLD_SHOULDER_HOURS, MAX_CONTEXT_MESSAGES } from "../config/env.js";
+import {
+  loadFullContext,
+  saveInteraction,
+  persistMemoryTags,
+} from "../services/persistentMemory.js";
+import { COLD_SHOULDER_HOURS } from "../config/env.js";
 
 const router = express.Router();
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/**
- * Calculates the number of hours between `lastTimestamp` and now.
- * Returns Infinity if lastTimestamp is null (first ever message).
- *
- * @param {Date|null} lastTimestamp
- * @returns {number}
- */
 function hoursSince(lastTimestamp) {
-  if (!lastTimestamp) return 0; // First message – no friction
-  const ms = Date.now() - new Date(lastTimestamp).getTime();
-  return ms / (1000 * 60 * 60);
+  if (!lastTimestamp) return 0;
+  return (Date.now() - new Date(lastTimestamp).getTime()) / (1000 * 60 * 60);
 }
 
-/**
- * Calculates a cold-shoulder opening delay in ms.
- * The bot "takes a moment" before responding after a long absence,
- * mirroring the emotional friction of the cold shoulder.
- * @returns {number} ms to wait (5 000 – 12 000)
- */
 function coldShoulderDelay() {
-  return 5000 + Math.random() * 7000; // 5–12 seconds
+  return 5000 + Math.random() * 7000;
 }
 
-// ─── Main Webhook Handler ─────────────────────────────────────────────────────
+// ─── POST /webhook ────────────────────────────────────────────────────────────
 
-/**
- * POST /webhook
- *
- * Green API sends all instance notifications here.
- * We respond with 200 immediately (to prevent retries) and process async.
- */
 router.post("/", async (req, res) => {
-  // Acknowledge receipt immediately – Green API retries on non-2xx
   res.status(200).json({ status: "received" });
 
-  // 🔥 ADDED LOG 1: Print exactly what type of payload Green API sent
-  console.log("📥 [webhook] Payload Type:", req.body?.typeWebhook || "Unknown");
-
   const parsed = parseIncomingWebhook(req.body);
-  if (!parsed) {
-    // Not a message we handle (status update, media, etc.) – silently ignore
-    // 🔥 ADDED LOG 2: Show us why it was ignored
-    console.log("🚫 [webhook] Ignored non-text webhook or unhandled format. Raw Data:", JSON.stringify(req.body));
-    return;
-  }
+  if (!parsed) return;
 
   const { chatId, text: userText } = parsed;
-  
-  // 🔥 ADDED LOG 3: Confirm we successfully parsed a text message
-  console.log(`💬 [webhook] Valid text from ${chatId}: "${userText}"`);
 
-  // ── Concurrency guard ──────────────────────────────────────────────────────
-  // If we're already generating a reply for this chat, drop this message.
-  // (Green API can occasionally deliver duplicates)
   if (isLocked(chatId)) {
     console.log(`[webhook] Skipping ${chatId} – already processing.`);
     return;
   }
 
   acquireLock(chatId);
-
   try {
     await handleIncomingMessage(chatId, userText);
   } catch (err) {
@@ -94,124 +52,83 @@ router.post("/", async (req, res) => {
 
 // ─── Core Handler ─────────────────────────────────────────────────────────────
 
-/**
- * Full message processing pipeline for a verified inbound text message.
- *
- * @param {string} chatId
- * @param {string} userText
- */
 async function handleIncomingMessage(chatId, userText) {
-  // ── Step 1: Instant typing indicator ───────────────────────────────────────
-  // Signal "composing" immediately so the user sees we're active.
-  // This fires before any async DB work.
+  // 1. Instant typing indicator
   await setChatState(chatId, "composing");
 
-  // ── Step 2: Upsert user document ───────────────────────────────────────────
-  let user = await User.findOne({ chatId });
+  // 2. Load full context from MongoDB (survives restarts/redeploys)
+  const {
+    user,
+    recentHistory,
+    memoryMap,
+    daysActive,
+    coldShoulderActive,
+  } = await loadFullContext(chatId);
 
-  if (!user) {
-    user = new User({ chatId });
-    console.log(`[webhook] New user created: ${chatId}`);
-  }
-
-  // ── Step 3: Cold Shoulder detection ────────────────────────────────────────
+  // 3. Cold shoulder detection
   const hours = hoursSince(user.last_message_timestamp);
-  const shouldActivateColdShoulder = hours >= COLD_SHOULDER_HOURS;
+  const triggerColdShoulder = hours >= COLD_SHOULDER_HOURS && !coldShoulderActive;
+  const effectiveColdShoulder = coldShoulderActive || triggerColdShoulder;
 
-  if (shouldActivateColdShoulder && !user.coldShoulderActive) {
-    user.coldShoulderActive = true;
-    console.log(
-      `[webhook] Cold Shoulder activated for ${chatId} (${hours.toFixed(1)}h silence)`
-    );
+  if (triggerColdShoulder) {
+    console.log(`[webhook] Cold Shoulder for ${chatId} (${hours.toFixed(1)}h silence)`);
   }
 
-  // ── Step 4: Update engagement stats ────────────────────────────────────────
-  user.last_message_timestamp = new Date();
-  user.messageCount += 1;
-
-  // ── Step 5: Append user message to history ─────────────────────────────────
-  user.addMessage("user", userText, MAX_CONTEXT_MESSAGES);
-
-  // ── Step 6: Shadow memory extraction (non-blocking) ────────────────────────
-  // Fire and forget – we save results if they come back before the user doc save
-  const memoryPromise = extractShadowMemory(
-    userText,
-    user.conversationHistory.toObject
-      ? user.conversationHistory.toObject()
-      : user.conversationHistory
-  ).then((extracted) => {
-    const entries = Object.entries(extracted);
-    if (entries.length > 0) {
-      entries.forEach(([key, value]) => {
-        if (typeof value === "string" && value.trim()) {
-          user.upsertMemoryTag(key, value.trim());
-        }
-      });
-      console.log(
-        `[webhook] Shadow memory updated for ${chatId}:`,
-        Object.keys(extracted)
-      );
-    }
-  }).catch((err) => {
-    console.warn("[webhook] Shadow memory extraction swallowed:", err.message);
-  });
-
-  // ── Step 7: Build context for AI call ──────────────────────────────────────
-  const daysActive = user.daysActive;
-  const coldShoulderActive = user.coldShoulderActive;
-  const memoryMap = user.getMemoryMap();
-
-  // If cold shoulder is active, add a brief realistic delay before the bot
-  // starts "typing" – simulates reluctant engagement.
-  if (coldShoulderActive) {
+  if (effectiveColdShoulder) {
     const delay = coldShoulderDelay();
     console.log(`[webhook] Cold Shoulder delay: ${Math.round(delay / 1000)}s`);
     await sleep(delay);
-    await setChatState(chatId, "composing"); // Re-signal after the gap
+    await setChatState(chatId, "composing");
   }
 
-  // ── Step 8: Generate AI response ───────────────────────────────────────────
+  // 4. Build context window including the new user message
+  const contextWithNewMsg = [
+    ...recentHistory,
+    { role: "user", content: userText },
+  ];
+
+  // 5. Shadow memory extraction (non-blocking race)
+  const memoryPromise = extractShadowMemory(userText, contextWithNewMsg)
+    .then((extracted) => {
+      if (Object.keys(extracted).length > 0) {
+        return persistMemoryTags(chatId, extracted);
+      }
+    })
+    .catch((err) =>
+      console.warn("[webhook] Shadow memory swallowed:", err.message)
+    );
+
+  // 6. Generate response
   const rawResponse = await generateRawResponse({
     userText,
-    conversationHistory: user.conversationHistory,
+    conversationHistory: contextWithNewMsg,
     daysActive,
-    coldShoulderActive,
+    coldShoulderActive: effectiveColdShoulder,
     memoryMap,
   });
 
-  // ── Step 9: Append assistant message to history ────────────────────────────
-  user.addMessage("assistant", rawResponse, MAX_CONTEXT_MESSAGES);
+  // 7. Atomic write to MongoDB – history + state in one operation
+  //    This is the line that makes memory survive code updates.
+  //    Even if the process crashes after this, the interaction is saved.
+  const updatedMemory = await memoryPromise
+    .then(() => extractShadowMemory(userText, contextWithNewMsg))
+    .catch(() => ({}));
 
-  // Cold shoulder is resolved after one reply
-  user.coldShoulderActive = false;
+  await saveInteraction(
+    chatId,
+    userText,
+    rawResponse,
+    updatedMemory ?? {},
+    { coldShoulderActive: false }
+  );
 
-  // ── Step 10: Await memory extraction (give it up to 3 extra seconds) ───────
-  await Promise.race([
-    memoryPromise,
-    sleep(3000),
-  ]);
-
-  // ── Step 11: Persist to DB ─────────────────────────────────────────────────
-  await user.save();
-
-  // ── Step 12: Humanize and send ─────────────────────────────────────────────
+  // 8. Send – happens AFTER save so even if send fails, history is intact
   await humanizeAndSend(chatId, rawResponse);
 
+  const phase = daysActive > 21 ? 4 : daysActive > 14 ? 3 : daysActive > 7 ? 2 : 1;
   console.log(
-    `[webhook] Replied to ${chatId} | Day ${daysActive} | Phase ${getPhaseNumber(daysActive)} | ColdShoulder: ${coldShoulderActive}`
+    `[webhook] ✓ ${chatId} | Day ${daysActive} | Phase ${phase} | Cold: ${effectiveColdShoulder}`
   );
-}
-
-/**
- * Quick phase number lookup for logging (mirrors buildSystemPrompt logic).
- * @param {number} daysActive
- * @returns {number}
- */
-function getPhaseNumber(daysActive) {
-  if (daysActive <= 7) return 1;
-  if (daysActive <= 14) return 2;
-  if (daysActive <= 21) return 3;
-  return 4;
 }
 
 export default router;
