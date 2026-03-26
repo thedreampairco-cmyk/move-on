@@ -1,9 +1,4 @@
 // models/User.js
-// Mongoose schema for a Move-On Bot user.
-// Memory architecture:
-//   • conversationHistory  – rolling hot window (last HOT_WINDOW_SIZE msgs)
-//   • memoryTags           – MongoDB Map (key-value facts, survives forever)
-//   • Older history        – archived to MemorySnapshot collection by persistentMemory.js
 
 import mongoose from "mongoose";
 
@@ -18,33 +13,39 @@ const MessageSchema = new mongoose.Schema(
 
 const UserSchema = new mongoose.Schema(
   {
+    // ── Identity ────────────────────────────────────────────────────────────
     chatId: {
       type: String, required: true, unique: true, index: true, trim: true,
     },
-
     createdAt: { type: Date, default: Date.now },
 
-    last_message_timestamp: { type: Date, default: null },
+    // ── Timing / Activity ────────────────────────────────────────────────────
+    last_message_timestamp: { type: Date,    default: null },
+    pendingReplyAt:         { type: Date,    default: null }, // scheduled delayed reply
+    proactive_sent_today:   { type: Number,  default: 0    },
+    proactive_last_date:    { type: String,  default: null },
 
-    proactive_sent_today: { type: Number, default: 0 },
-    proactive_last_date:  { type: String, default: null },
+    // ── Relationship Score (0–100) ───────────────────────────────────────────
+    // Drives phase-based reply timing in typingDelay.js:
+    //   Phase 1:  0–25  → initial reply delay 30 min – 3 hr
+    //   Phase 2: 26–50  → 15 min – 45 min
+    //   Phase 3: 51–75  →  5 min – 10 min
+    //   Phase 4: 76–100 →  1 min –  5 min
+    relationship_score: { type: Number, default: 1, min: 0, max: 100 },
 
-    // Rolling hot window – capped by persistentMemory.saveInteraction via $slice
+    // ── Conversation History (hot window) ────────────────────────────────────
+    // Capped by persistentMemory.saveInteraction via $push + $slice.
+    // Older messages are archived to memory_snapshots collection.
     conversationHistory: { type: [MessageSchema], default: [] },
 
-    // ── Persistent Memory Tags ─────────────────────────────────────────────
-    // Stored as a MongoDB Map so individual keys can be updated with $set
-    // dot-notation without rewriting the entire object.
-    // Shape: { morning_routine: "gym at 7am", ex_name: "Rahul", ... }
-    // This Map NEVER gets wiped on code updates or restarts.
-    memoryTags: {
-      type: Map,
-      of: String,
-      default: {},
-    },
+    // ── Persistent Memory Tags ───────────────────────────────────────────────
+    // Stored as plain Object so individual keys survive rolling history trims.
+    // Written as a whole object (never dot-notation) by persistentMemory.js.
+    memoryTags: { type: Object, default: {} },
 
+    // ── State Flags ──────────────────────────────────────────────────────────
     coldShoulderActive: { type: Boolean, default: false },
-    messageCount:       { type: Number,  default: 0 },
+    messageCount:       { type: Number,  default: 0    },
   },
   { timestamps: true, collection: "users" }
 );
@@ -57,51 +58,38 @@ UserSchema.virtual("daysActive").get(function () {
 
 // ─── Instance Methods ─────────────────────────────────────────────────────────
 
-/**
- * Appends a message. Used only for in-memory manipulation before save.
- * The atomic DB path uses persistentMemory.saveInteraction ($push + $slice).
- */
 UserSchema.methods.addMessage = function (role, content, maxMessages = 30) {
   this.conversationHistory.push({ role, content, timestamp: new Date() });
   if (this.conversationHistory.length > maxMessages * 2) {
-    this.conversationHistory = this.conversationHistory.slice(
-      -(maxMessages * 2)
-    );
+    this.conversationHistory = this.conversationHistory.slice(-(maxMessages * 2));
   }
 };
 
-/**
- * Upserts a memory tag in the Map field.
- * Works for both Mongoose Map and plain object (handles both cases safely).
- */
 UserSchema.methods.upsertMemoryTag = function (key, value) {
-  if (this.memoryTags instanceof Map) {
-    this.memoryTags.set(key, value);
-  } else {
-    this.memoryTags[key] = value;
+  if (!this.memoryTags || typeof this.memoryTags !== "object") {
+    this.memoryTags = {};
   }
+  this.memoryTags[key] = value;
   this.markModified("memoryTags");
 };
 
-/**
- * Returns a plain { key: value } object for prompt injection.
- * Works whether memoryTags is a Mongoose Map or plain object.
- */
 UserSchema.methods.getMemoryMap = function () {
-  if (this.memoryTags instanceof Map) {
-    return Object.fromEntries(this.memoryTags);
+  // Handle legacy array format gracefully
+  if (Array.isArray(this.memoryTags)) {
+    const obj = {};
+    for (const tag of this.memoryTags) {
+      if (tag?.key && tag?.value) obj[tag.key] = tag.value;
+    }
+    return obj;
   }
-  return { ...this.memoryTags };
+  return typeof this.memoryTags === "object" ? { ...this.memoryTags } : {};
 };
 
-/**
- * Resets proactive_sent_today if it's a new calendar day.
- */
 UserSchema.methods.checkAndResetProactiveCount = function () {
   const todayStr = new Date().toISOString().slice(0, 10);
   if (this.proactive_last_date !== todayStr) {
     this.proactive_sent_today = 0;
-    this.proactive_last_date = todayStr;
+    this.proactive_last_date  = todayStr;
   }
 };
 

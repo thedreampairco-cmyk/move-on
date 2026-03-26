@@ -1,9 +1,7 @@
 // routes/webhook.js
-// Webhook handler – fully wired to persistentMemory for atomic, crash-safe writes.
-// History and memory tags survive all code updates and server restarts.
 
 import express from "express";
-import { parseIncomingWebhook, setChatState, sleep } from "../services/greenApi.js";
+import { parseIncomingWebhook, setChatState } from "../services/greenApi.js";
 import { generateRawResponse, extractShadowMemory } from "../services/aiResponse.js";
 import { humanizeAndSend } from "../services/humanizer.js";
 import { isLocked, acquireLock, releaseLock } from "../services/memoryStore.js";
@@ -12,20 +10,19 @@ import {
   saveInteraction,
   persistMemoryTags,
 } from "../services/persistentMemory.js";
+import {
+  computeInitialDelay,
+  incrementRelationshipScore,
+  scoreToPhase,
+} from "../services/typingDelay.js";
 import { COLD_SHOULDER_HOURS } from "../config/env.js";
 
 const router = express.Router();
 
-function hoursSince(lastTimestamp) {
-  if (!lastTimestamp) return 0;
-  return (Date.now() - new Date(lastTimestamp).getTime()) / (1000 * 60 * 60);
+function hoursSince(ts) {
+  if (!ts) return 0;
+  return (Date.now() - new Date(ts).getTime()) / (1000 * 60 * 60);
 }
-
-function coldShoulderDelay() {
-  return 5000 + Math.random() * 7000;
-}
-
-// ─── POST /webhook ────────────────────────────────────────────────────────────
 
 router.post("/", async (req, res) => {
   res.status(200).json({ status: "received" });
@@ -34,71 +31,46 @@ router.post("/", async (req, res) => {
   if (!parsed) return;
 
   const { chatId, text: userText } = parsed;
-
-  if (isLocked(chatId)) {
-    console.log(`[webhook] Skipping ${chatId} – already processing.`);
-    return;
-  }
+  if (isLocked(chatId)) return;
 
   acquireLock(chatId);
   try {
     await handleIncomingMessage(chatId, userText);
   } catch (err) {
-    console.error(`[webhook] Unhandled error for ${chatId}:`, err);
+    console.error(`[webhook] Error for ${chatId}:`, err);
   } finally {
     releaseLock(chatId);
   }
 });
 
-// ─── Core Handler ─────────────────────────────────────────────────────────────
-
 async function handleIncomingMessage(chatId, userText) {
-  // 1. Instant typing indicator
+  // 1. Load full context from DB
+  const { user, recentHistory, memoryMap, daysActive, coldShoulderActive } =
+    await loadFullContext(chatId);
+
+  // 2. Compute initial reply delay NOW (before any async work)
+  //    so the clock starts from when she "read" the message
+  const initialDelayMs = await computeInitialDelay(user);
+
+  // 3. Show composing immediately (she picked up phone)
   await setChatState(chatId, "composing");
 
-  // 2. Load full context from MongoDB (survives restarts/redeploys)
-  const {
-    user,
-    recentHistory,
-    memoryMap,
-    daysActive,
-    coldShoulderActive,
-  } = await loadFullContext(chatId);
+  // 4. Cold shoulder check
+  const triggerCold       = hoursSince(user.last_message_timestamp) >= COLD_SHOULDER_HOURS;
+  const effectiveColdShoulder = coldShoulderActive || triggerCold;
 
-  // 3. Cold shoulder detection
-  const hours = hoursSince(user.last_message_timestamp);
-  const triggerColdShoulder = hours >= COLD_SHOULDER_HOURS && !coldShoulderActive;
-  const effectiveColdShoulder = coldShoulderActive || triggerColdShoulder;
-
-  if (triggerColdShoulder) {
-    console.log(`[webhook] Cold Shoulder for ${chatId} (${hours.toFixed(1)}h silence)`);
-  }
-
-  if (effectiveColdShoulder) {
-    const delay = coldShoulderDelay();
-    console.log(`[webhook] Cold Shoulder delay: ${Math.round(delay / 1000)}s`);
-    await sleep(delay);
-    await setChatState(chatId, "composing");
-  }
-
-  // 4. Build context window including the new user message
+  // 5. Context window including new user message
   const contextWithNewMsg = [
     ...recentHistory,
     { role: "user", content: userText },
   ];
 
-  // 5. Shadow memory extraction (non-blocking race)
+  // 6. Shadow memory extraction (non-blocking)
   const memoryPromise = extractShadowMemory(userText, contextWithNewMsg)
-    .then((extracted) => {
-      if (Object.keys(extracted).length > 0) {
-        return persistMemoryTags(chatId, extracted);
-      }
-    })
-    .catch((err) =>
-      console.warn("[webhook] Shadow memory swallowed:", err.message)
-    );
+    .then((tags) => Object.keys(tags).length > 0 && persistMemoryTags(chatId, tags))
+    .catch(() => {});
 
-  // 6. Generate response
+  // 7. Generate response
   const rawResponse = await generateRawResponse({
     userText,
     conversationHistory: contextWithNewMsg,
@@ -107,27 +79,24 @@ async function handleIncomingMessage(chatId, userText) {
     memoryMap,
   });
 
-  // 7. Atomic write to MongoDB – history + state in one operation
-  //    This is the line that makes memory survive code updates.
-  //    Even if the process crashes after this, the interaction is saved.
-  const updatedMemory = await memoryPromise
-    .then(() => extractShadowMemory(userText, contextWithNewMsg))
-    .catch(() => ({}));
+  // 8. Save interaction to DB (before send – crash safe)
+  const extractedTags = await Promise.race([memoryPromise.then(() =>
+    extractShadowMemory(userText, contextWithNewMsg)), new Promise(r => setTimeout(() => r({}), 3000))
+  ]).catch(() => ({}));
 
-  await saveInteraction(
-    chatId,
-    userText,
-    rawResponse,
-    updatedMemory ?? {},
-    { coldShoulderActive: false }
-  );
+  await saveInteraction(chatId, userText, rawResponse, extractedTags ?? {}, {
+    coldShoulderActive: false,
+  });
 
-  // 8. Send – happens AFTER save so even if send fails, history is intact
-  await humanizeAndSend(chatId, rawResponse);
+  // 9. Increment relationship score
+  const newScore = await incrementRelationshipScore(chatId);
 
-  const phase = daysActive > 21 ? 4 : daysActive > 14 ? 3 : daysActive > 7 ? 2 : 1;
+  // 10. Humanize + send with full Golden Rule timing
+  //     Pass the pre-computed initialDelayMs so the delay is not re-computed
+  await humanizeAndSend(chatId, rawResponse, user, initialDelayMs);
+
   console.log(
-    `[webhook] ✓ ${chatId} | Day ${daysActive} | Phase ${phase} | Cold: ${effectiveColdShoulder}`
+    `[webhook] ✓ ${chatId} | Day ${daysActive} | Phase ${scoreToPhase(newScore)} | Score ${newScore}`
   );
 }
 

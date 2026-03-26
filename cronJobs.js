@@ -45,7 +45,7 @@ async function sendProactiveMessage(user, slot) {
 
   // Persist before sending – history is safe even if WhatsApp delivery fails
   await saveProactiveMessage(user.chatId, rawResponse, slot.name);
-  await humanizeAndSend(user.chatId, rawResponse);
+  await humanizeAndSend(user.chatId, rawResponse, user, 0); // proactive = no initial delay
 
   console.log(`[cron] ✓ Proactive [${slot.name}] → ${user.chatId} | Day ${daysActive}`);
 }
