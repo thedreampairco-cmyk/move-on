@@ -1,10 +1,10 @@
 // services/typingDelay.js
 // ═══════════════════════════════════════════════════════════════════════════════
-// REALISTIC TYPING DELAY ENGINE
+// REALISTIC TYPING DELAY ENGINE (TESTING MODE ACTIVE)
 //
 // Implements the Golden Rule delay sequence:
-//   1. Reading Phase  : 3–5s  (she picked up the phone, opened chat, read it)
-//   2. Typing Phase   : 7–15s per 30 characters of her reply
+//   1. Reading Phase  : 1–2s  (Testing)
+//   2. Typing Phase   : 1-3s total  (Testing)
 //
 // Plus Phase-aware Initial Reply Delays (first message after a gap):
 //   Phase 1 (score  0–25): 30 min – 3 hrs
@@ -16,22 +16,20 @@
 import User from "../models/User.js";
 import { setChatState, sleep, sendTextMessage } from "./greenApi.js";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Constants (TESTING MODE) ─────────────────────────────────────────────────
 
-const READING_PHASE_MIN_MS  = 3_000;
-const READING_PHASE_MAX_MS  = 5_000;
+const READING_PHASE_MIN_MS  = 1_000; // 1 second
+const READING_PHASE_MAX_MS  = 2_000; // 2 seconds
 
-const TYPING_PER_CHUNK_MIN_MS = 7_000;
-const TYPING_PER_CHUNK_MAX_MS = 15_000;
-const CHARS_PER_CHUNK         = 30;
+// Make typing fast and prevent multiplication for long texts
+const TYPING_PER_CHUNK_MIN_MS = 1_000; // 1 second
+const TYPING_PER_CHUNK_MAX_MS = 3_000; // 3 seconds
+const CHARS_PER_CHUNK         = 1000;  // High enough to always count as 1 chunk
 
 // Green API typing indicator refreshes every N ms to keep the "typing..." alive
-// (most WA clients drop the indicator after ~5s if not re-sent)
 const TYPING_REFRESH_INTERVAL_MS = 4_000;
 
 // Minimum silence gap (ms) before an "initial reply delay" applies.
-// If the last message was less than this ago, we're in active chat — use
-// only the reading + typing formula, not the long phase-based delay.
 const ACTIVE_CHAT_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
 // Phase 1 active-chat inner delay: she puts the phone down mid-convo
@@ -100,8 +98,8 @@ export function getInitialReplyDelayRange(score) {
 /**
  * Calculates how long the "typing..." indicator should show for a given
  * reply text using the Golden Rule formula:
- *   • Divide text into 30-char chunks
- *   • Each chunk = random 7–15 seconds
+ * • Divide text into chunks (Currently set to 1000 chars for testing)
+ * • Each chunk = random 1-3 seconds
  *
  * @param {string} text  The bot's reply text
  * @returns {{ totalMs: number, chunks: number, perChunkMs: number[] }}
@@ -162,8 +160,8 @@ export function buildPreemptiveNotice(delayMs) {
  * (last message was > ACTIVE_CHAT_THRESHOLD_MS ago).
  *
  * If active chat (within threshold):
- *   - Phase 1: occasional 1.5–3 min pause (she put the phone down)
- *   - Phase 2–4: no extra delay beyond reading + typing formula
+ * - Phase 1: occasional 1.5–3 min pause (she put the phone down)
+ * - Phase 2–4: no extra delay beyond reading + typing formula
  *
  * @param {object} user       Mongoose User document
  * @param {number} nowMs      Date.now()
@@ -209,13 +207,13 @@ export async function computeInitialDelay(user, nowMs = Date.now()) {
  * The single entry point called by the webhook handler and cron jobs.
  * Executes the complete Golden Rule sequence for ONE text fragment:
  *
- *   [initial reply delay if cold chat]
- *       ↓
- *   [reading phase: 3–5s silence]
- *       ↓
- *   [typing phase: setChatState("composing") for calculated duration]
- *       ↓
- *   [sendTextMessage]
+ * [initial reply delay if cold chat]
+ * ↓
+ * [reading phase: 1–2s silence (TESTING)]
+ * ↓
+ * [typing phase: setChatState("composing") for calculated duration]
+ * ↓
+ * [sendTextMessage]
  *
  * For multi-fragment messages (double texts), call this per fragment.
  * The first fragment uses the full initial delay; subsequent fragments
@@ -300,10 +298,10 @@ export async function delayAndSend({
 /**
  * Increments the relationship_score after each interaction.
  * Score is capped at 100. Progression rules:
- *   Phase 1 (0–25):  +1 per message exchange
- *   Phase 2 (26–50): +0.7 per exchange (slower – she's assessing)
- *   Phase 3 (51–75): +0.5 per exchange (deep comfort, slower movement)
- *   Phase 4 (76+):   +0.2 per exchange (nearly stable)
+ * Phase 1 (0–25):  +1 per message exchange
+ * Phase 2 (26–50): +0.7 per exchange (slower – she's assessing)
+ * Phase 3 (51–75): +0.5 per exchange (deep comfort, slower movement)
+ * Phase 4 (76+):   +0.2 per exchange (nearly stable)
  *
  * @param {string} chatId
  * @returns {Promise<number>} New score
